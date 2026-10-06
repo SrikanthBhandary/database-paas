@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: paas-postgres
+    environment:
+      POSTGRES_USER: paas
+      POSTGRES_PASSWORD: paas
+      POSTGRES_DB: paas
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paas -d paas"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pgdata:

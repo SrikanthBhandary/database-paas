@@ -1,0 +1,26 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: db-test
+  namespace: tenant-test
+spec:
+  instances: 1
+  storage:
+    size: 1Gi
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: minio-store
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: db-test-daily
+  namespace: tenant-test
+spec:
+  schedule: "0 0 2 * * *"   # 6 fields: seconds first
+  cluster: {name: db-test}
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

@@ -1,0 +1,14 @@
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: minio-store
+  namespace: tenant-test
+spec:
+  configuration:
+    destinationPath: s3://cnpg-backups/
+    endpointURL: http://minio.minio.svc:9000
+    s3Credentials:
+      accessKeyId: {name: minio-creds, key: ACCESS_KEY_ID}
+      secretAccessKey: {name: minio-creds, key: ACCESS_SECRET_KEY}
+    wal:
+      compression: gzip

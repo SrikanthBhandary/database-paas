@@ -42,6 +42,10 @@ func validate(in CreateDatabaseInput) (Plan, map[string]string) {
 	if !in.Engine.Valid() {
 		errs["engine"] = "unsupported engine"
 	}
+
+	// Support the exact versions for target
+	// engine.
+
 	if planOK {
 		validateStorage(in, plan, errs)
 		validateAutoscale(in, plan, errs)

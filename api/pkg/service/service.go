@@ -53,6 +53,7 @@ func (s *Service) CreateDatabase(ctx context.Context, in CreateDatabaseInput) (d
 		Name:      in.Name,
 		Engine:    in.Engine,
 		Version:   in.Version,
+		Replicas:  in.Replicas, // was missing
 		Plan:      plan.Name,
 		Status:    database.StatusPending,
 		OwnerID:   in.OwnerID,
@@ -77,4 +78,8 @@ func (s *Service) GetDatabase(ctx context.Context, ownerID, id string) (database
 		return database.Database{}, database.ErrNotFound // 404, not 403: don't reveal it exists
 	}
 	return db, nil
+}
+
+func (s *Service) ListDatabases(ctx context.Context, ownerID string) ([]database.Database, error) {
+	return s.store.List(ctx, ownerID)
 }

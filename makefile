@@ -5,6 +5,9 @@ DATABASE_URL ?= postgres://paas:paas@localhost:5432/paas?sslmode=disable
 GOOSE        ?= go run github.com/pressly/goose/v3/cmd/goose@latest
 MIGRATIONS   ?= deploy/migrations
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
+GO_DIR ?= api
+COVER_OUT ?= $(CURDIR)/coverage.out
+
 
 
 # ---- config ----
@@ -108,23 +111,23 @@ minio-console: ## port-forward the MinIO console to localhost:9001
 # ---- Go ----
 .PHONY: run
 run: ## run the API server
-	go run . -port $(PORT)
+	go -C $(GO_DIR) run . -port $(PORT)
 
 .PHONY: build
 build: ## build the binary into bin/
-	go build -o bin/db-paas .
+	go -C $(GO_DIR) build -o ../bin/db-paas .
 
 .PHONY: test
 test: ## run tests with the race detector
-	go test -race -count=1 ./...
+	go -C $(GO_DIR) test -race -count=1 ./...
 
 .PHONY: vet
 vet: ## go vet
-	go vet ./...
+	go -C $(GO_DIR) vet ./...
 
 .PHONY: tidy
 tidy: ## go mod tidy
-	go mod tidy
+	go -C $(GO_DIR) mod tidy
 
 # ---- control-plane database ----
 PHONY: db-up
@@ -160,3 +163,41 @@ migrate-status: ## show migration status
 .PHONY: migrate-new
 migrate-new: ## create a migration: make migrate-new name=add_something
 	$(GOOSE) -dir $(MIGRATIONS) create $(name) sql
+
+TEST_DB           ?= paas_test
+TEST_DATABASE_URL ?= postgres://paas:paas@localhost:5432/$(TEST_DB)?sslmode=disable
+
+.PHONY: db-test-create
+db-test-create: db-up ## create and migrate the test database (safe to rerun)
+	@$(COMPOSE) exec -T postgres psql -U paas -d postgres -tAc \
+		"SELECT 1 FROM pg_database WHERE datname='$(TEST_DB)'" | grep -q 1 || \
+		$(COMPOSE) exec -T postgres createdb -U paas $(TEST_DB)
+	$(GOOSE) -dir $(MIGRATIONS) postgres "$(TEST_DATABASE_URL)" up
+
+.PHONY: db-test-drop
+db-test-drop: ## drop the test database
+	$(COMPOSE) exec -T postgres dropdb -U paas --if-exists --force $(TEST_DB)
+
+.PHONY: db-test-reset
+db-test-reset: db-test-drop db-test-create ## drop and recreate the test database
+
+.PHONY: test-integration
+test-integration: db-test-create ## run store tests against real Postgres
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go -C $(GO_DIR) test -tags integration -race -count=1 ./pkg/repository/...
+
+COVER_OUT ?= $(CURDIR)/coverage.out
+
+.PHONY: cover
+cover: db-test-create ## unit + integration tests with coverage (needs Postgres)
+	TEST_DATABASE_URL="$(TEST_DATABASE_URL)" go -C $(GO_DIR) test -tags integration \
+		-race -count=1 -coverprofile=$(COVER_OUT) -covermode=atomic ./...
+	go -C $(GO_DIR) tool cover -func=$(COVER_OUT) | tail -n 1
+
+.PHONY: cover-html
+cover-html: cover ## open the coverage report in a browser
+	go -C $(GO_DIR) tool cover -html=$(COVER_OUT)
+
+.PHONY: cover-unit
+cover-unit: ## coverage without a database (excludes the Postgres package)
+	go -C $(GO_DIR) test -race -count=1 -coverprofile=$(COVER_OUT) -covermode=atomic ./...
+	go -C $(GO_DIR) tool cover -func=$(COVER_OUT) | tail -n 1

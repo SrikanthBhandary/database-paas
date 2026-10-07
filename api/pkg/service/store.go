@@ -11,7 +11,3 @@ type Store interface {
 	List(ctx context.Context, ownerID string) ([]database.Database, error)
 	UpdateStatus(ctx context.Context, id string, status database.Status, reason string) error
 }
-
-type Service struct{ store Store }
-
-func New(store Store) *Service { return &Service{store: store} }

@@ -62,6 +62,7 @@ func newDB(owner, name string) database.Database {
 		ID:        uuid.NewString(),
 		Name:      name,
 		Engine:    database.EnginePostgres,
+		Replicas:  2,
 		Version:   "17",
 		Plan:      "small",
 		Status:    database.StatusPending,
@@ -69,7 +70,7 @@ func newDB(owner, name string) database.Database {
 		Resources: database.Resources{CPUMillicores: 500, MemoryMB: 1024, StorageGB: 10},
 		Autoscale: database.Autoscale{
 			Enabled:      true,
-			MaxResources: database.Resources{CPUMillicores: 2000, MemoryMB: 4096, StorageGB: 50},
+			MaxStorageGB: 150,
 		},
 		Backup:    database.Backup{Enabled: true, Schedule: "0 2 * * *", RetentionDays: 7},
 		CreatedAt: now,
@@ -251,6 +252,7 @@ func TestListUnknownOwnerIsEmpty(t *testing.T) {
 func TestUpdateStatus(t *testing.T) {
 	s := newStore(t)
 	in := newDB("alice", "a")
+	in.UpdatedAt = in.UpdatedAt.Add(-time.Hour) // far enough back to survive clock skew
 	_ = s.Create(t.Context(), in)
 
 	if err := s.UpdateStatus(t.Context(), in.ID, database.StatusFailed, "out of capacity"); err != nil {
@@ -285,6 +287,16 @@ func TestUpdateStatusInvalid(t *testing.T) {
 
 	err := s.UpdateStatus(t.Context(), in.ID, database.Status("exploded"), "")
 	if !errors.Is(err, database.ErrInvalidInput) {
+		t.Fatalf("err = %v, want ErrInvalidInput", err)
+	}
+}
+
+func TestCreateNegativeReplicas(t *testing.T) {
+	s := newStore(t)
+	in := newDB("alice", "a")
+	in.Replicas = -1 // violates the CHECK constraint
+
+	if err := s.Create(t.Context(), in); !errors.Is(err, database.ErrInvalidInput) {
 		t.Fatalf("err = %v, want ErrInvalidInput", err)
 	}
 }

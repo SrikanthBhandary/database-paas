@@ -2,13 +2,14 @@ package postgres
 
 import (
 	"context"
-	"db-paas/pkg/database"
 	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"db-paas/pkg/database"
 )
 
 type Store struct {
@@ -19,11 +20,11 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+// The order here must match the Scan order in scan() and the INSERT below.
 const columns = `id::text, name, engine, version, plan, status, status_reason, owner_id,
 	cpu_millicores, memory_mb, storage_gb,
-	autoscale_enabled,
-	autoscale_min_cpu_millicores, autoscale_min_memory_mb, autoscale_min_storage_gb,
-	autoscale_max_cpu_millicores, autoscale_max_memory_mb, autoscale_max_storage_gb,
+	replicas,
+	autoscale_enabled, autoscale_max_storage_gb,
 	backup_enabled, backup_schedule, backup_retention_days,
 	created_at, updated_at`
 
@@ -33,18 +34,16 @@ func (s *Store) Create(ctx context.Context, db database.Database) error {
 		`INSERT INTO databases (
 			id, name, engine, version, plan, status, status_reason, owner_id,
 			cpu_millicores, memory_mb, storage_gb,
-			autoscale_enabled,
-			autoscale_min_cpu_millicores, autoscale_min_memory_mb, autoscale_min_storage_gb,
-			autoscale_max_cpu_millicores, autoscale_max_memory_mb, autoscale_max_storage_gb,
+			replicas,
+			autoscale_enabled, autoscale_max_storage_gb,
 			backup_enabled, backup_schedule, backup_retention_days,
 			created_at, updated_at
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		db.ID, db.Name, string(db.Engine), db.Version, db.Plan, string(db.Status), db.StatusReason, db.OwnerID,
 		db.Resources.CPUMillicores, db.Resources.MemoryMB, db.Resources.StorageGB,
-		db.Autoscale.Enabled,
-		db.Autoscale.MinResources.CPUMillicores, db.Autoscale.MinResources.MemoryMB, db.Autoscale.MinResources.StorageGB,
-		db.Autoscale.MaxResources.CPUMillicores, db.Autoscale.MaxResources.MemoryMB, db.Autoscale.MaxResources.StorageGB,
+		db.Replicas,
+		db.Autoscale.Enabled, db.Autoscale.MaxStorageGB,
 		db.Backup.Enabled, db.Backup.Schedule, db.Backup.RetentionDays,
 		db.CreatedAt, db.UpdatedAt,
 	)
@@ -53,7 +52,7 @@ func (s *Store) Create(ctx context.Context, db database.Database) error {
 
 func (s *Store) Get(ctx context.Context, id string) (database.Database, error) {
 	row := s.pool.QueryRow(ctx,
-		`SELECT `+columns+` FROM databases WHERE id=$1`, id)
+		`SELECT `+columns+` FROM databases WHERE id = $1`, id)
 	db, err := scan(row)
 	if err != nil {
 		return database.Database{}, mapErr(err)
@@ -96,6 +95,28 @@ func (s *Store) UpdateStatus(ctx context.Context, id string, status database.Sta
 	return nil
 }
 
+// scan works for both pgx.Row and pgx.Rows.
+func scan(row pgx.Row) (database.Database, error) {
+	var (
+		db             database.Database
+		engine, status string
+	)
+	err := row.Scan(
+		&db.ID, &db.Name, &engine, &db.Version, &db.Plan, &status, &db.StatusReason, &db.OwnerID,
+		&db.Resources.CPUMillicores, &db.Resources.MemoryMB, &db.Resources.StorageGB,
+		&db.Replicas,
+		&db.Autoscale.Enabled, &db.Autoscale.MaxStorageGB,
+		&db.Backup.Enabled, &db.Backup.Schedule, &db.Backup.RetentionDays,
+		&db.CreatedAt, &db.UpdatedAt,
+	)
+	if err != nil {
+		return database.Database{}, err
+	}
+	db.Engine = database.Engine(engine)
+	db.Status = database.Status(status)
+	return db, nil
+}
+
 // mapErr translates pgx/Postgres errors into domain errors so nothing above
 // this package ever sees a pgx type.
 func mapErr(err error) error {
@@ -117,27 +138,4 @@ func mapErr(err error) error {
 		}
 	}
 	return err
-}
-
-// scan works for both pgx.Row and pgx.Rows.
-func scan(row pgx.Row) (database.Database, error) {
-	var (
-		db             database.Database
-		engine, status string
-	)
-	err := row.Scan(
-		&db.ID, &db.Name, &engine, &db.Version, &db.Plan, &status, &db.StatusReason, &db.OwnerID,
-		&db.Resources.CPUMillicores, &db.Resources.MemoryMB, &db.Resources.StorageGB,
-		&db.Autoscale.Enabled,
-		&db.Autoscale.MinResources.CPUMillicores, &db.Autoscale.MinResources.MemoryMB, &db.Autoscale.MinResources.StorageGB,
-		&db.Autoscale.MaxResources.CPUMillicores, &db.Autoscale.MaxResources.MemoryMB, &db.Autoscale.MaxResources.StorageGB,
-		&db.Backup.Enabled, &db.Backup.Schedule, &db.Backup.RetentionDays,
-		&db.CreatedAt, &db.UpdatedAt,
-	)
-	if err != nil {
-		return database.Database{}, err
-	}
-	db.Engine = database.Engine(engine)
-	db.Status = database.Status(status)
-	return db, nil
 }

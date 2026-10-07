@@ -34,6 +34,7 @@ const (
 type Database struct {
 	ID           string
 	Name         string
+	Replicas     int
 	Engine       Engine
 	Version      string
 	Plan         string
@@ -41,7 +42,7 @@ type Database struct {
 	StatusReason string
 	OwnerID      string
 	Resources    Resources
-	Autoscale    Autoscale
+	Autoscale    Autoscale // This is to autoscale the database size
 	Backup       Backup
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
@@ -55,8 +56,7 @@ type Resources struct {
 
 type Autoscale struct {
 	Enabled      bool
-	MinResources Resources // floor
-	MaxResources Resources // ceiling
+	MaxStorageGB int // ceiling
 }
 
 type Backup struct {

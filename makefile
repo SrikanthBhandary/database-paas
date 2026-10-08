@@ -219,3 +219,14 @@ run-all: ## API with the in-process worker (single terminal, development)
 build: ## build both binaries into bin/
 	go -C $(GO_DIR) build -o ../bin/api ./cmd/api
 	go -C $(GO_DIR) build -o ../bin/worker ./cmd/worker
+
+S3_ENDPOINT ?= http://minio.minio.svc:9000
+S3_BUCKET   ?= cnpg-backups
+
+.PHONY: run-worker-cnpg
+run-worker-cnpg: ## run a worker that provisions real CNPG clusters in kind
+	@kubectl config use-context kind-$(CLUSTER_NAME) >/dev/null
+	S3_ACCESS_KEY_ID=minioadmin S3_SECRET_ACCESS_KEY=minioadmin123 \
+	DATABASE_URL="$(DATABASE_URL)" \
+	go -C $(GO_DIR) run ./cmd/worker -provisioner cnpg \
+		-s3-endpoint $(S3_ENDPOINT) -s3-bucket $(S3_BUCKET)

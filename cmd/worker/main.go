@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"db-paas/pkg/provisioner/fake"
-	"db-paas/pkg/repository/postgres"
-	"db-paas/pkg/worker"
 	"errors"
 	"flag"
 	"net/http"
@@ -15,6 +12,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"k8s.io/client-go/dynamic"
+
+	"db-paas/pkg/provisioner/cnpg"
+	"db-paas/pkg/provisioner/fake"
+	"db-paas/pkg/repository/postgres"
+	"db-paas/pkg/worker"
 )
 
 func main() {
@@ -24,15 +27,26 @@ func main() {
 		concurrency    int
 		interval       time.Duration
 		reclaimAfter   time.Duration
+		provisionerArg string
 		provisionDelay time.Duration
+		kubeconfig     string
+		storageClass   string
+		imageRepo      string
+		s3Endpoint     string
+		s3Bucket       string
 	)
-
 	flag.StringVar(&dbURL, "database-url", os.Getenv("DATABASE_URL"), "Postgres connection string (default: $DATABASE_URL)")
 	flag.StringVar(&healthAddr, "health-addr", ":8081", "address for the /healthz probe endpoint (empty = disabled)")
 	flag.IntVar(&concurrency, "concurrency", 4, "max provisions in flight")
 	flag.DurationVar(&interval, "interval", 2*time.Second, "how often to poll for work")
 	flag.DurationVar(&reclaimAfter, "reclaim-after", 15*time.Minute, "retake rows stuck in provisioning for this long")
-	flag.DurationVar(&provisionDelay, "provision-delay", 5*time.Second, "how long the fake provisioner takes")
+	flag.StringVar(&provisionerArg, "provisioner", "fake", "fake | cnpg")
+	flag.DurationVar(&provisionDelay, "provision-delay", 5*time.Second, "fake provisioner: how long it takes")
+	flag.StringVar(&kubeconfig, "kubeconfig", "", "cnpg: kubeconfig path (default: in-cluster, then $KUBECONFIG, then ~/.kube/config)")
+	flag.StringVar(&storageClass, "storage-class", "", "cnpg: StorageClass for database volumes (default: cluster default)")
+	flag.StringVar(&imageRepo, "image-repo", "ghcr.io/cloudnative-pg/postgresql", "cnpg: Postgres image repository; the tag is the requested version")
+	flag.StringVar(&s3Endpoint, "s3-endpoint", "", "cnpg: S3 endpoint as seen from inside the cluster, e.g. http://minio.minio.svc:9000")
+	flag.StringVar(&s3Bucket, "s3-bucket", "cnpg-backups", "cnpg: backup bucket")
 	flag.Parse()
 
 	log, err := zap.NewProduction()
@@ -41,8 +55,6 @@ func main() {
 	}
 	defer log.Sync()
 
-	// A separate process cannot share an in-memory store with the API,
-	// so the worker requires a real database.
 	if dbURL == "" {
 		log.Fatal("a database URL is required: set -database-url or $DATABASE_URL")
 	}
@@ -56,10 +68,44 @@ func main() {
 		log.Fatal("ping database", zap.Error(err))
 	}
 
+	// ---- provisioner ----
+	var prov worker.Provisioner
+	switch provisionerArg {
+	case "fake":
+		prov = fake.Provisioner{Delay: provisionDelay}
+
+	case "cnpg":
+		restCfg, err := cnpg.RESTConfig(kubeconfig)
+		if err != nil {
+			log.Fatal("load kubernetes config", zap.Error(err))
+		}
+		client, err := dynamic.NewForConfig(restCfg)
+		if err != nil {
+			log.Fatal("create kubernetes client", zap.Error(err))
+		}
+
+		cfg := cnpg.Config{StorageClass: storageClass, ImageRepo: imageRepo}
+		// credentials come from the environment, never from flags (visible in `ps`)
+		accessKey, secretKey := os.Getenv("S3_ACCESS_KEY_ID"), os.Getenv("S3_SECRET_ACCESS_KEY")
+		if s3Endpoint != "" && accessKey != "" && secretKey != "" {
+			cfg.Backup = &cnpg.BackupStore{
+				Bucket: s3Bucket, EndpointURL: s3Endpoint,
+				AccessKeyID: accessKey, SecretAccessKey: secretKey,
+			}
+		} else {
+			log.Warn("no backup store configured; databases with backups enabled will fail to provision")
+		}
+		prov = cnpg.New(client, cfg)
+
+	default:
+		log.Fatal("unknown -provisioner (want fake or cnpg)", zap.String("value", provisionerArg))
+	}
+	log.Info("provisioner selected", zap.String("kind", provisionerArg))
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	w, err := worker.New(postgres.New(pool), fake.Provisioner{Delay: provisionDelay}, log, worker.Config{
+	w, err := worker.New(postgres.New(pool), prov, log, worker.Config{
 		Interval:         interval,
 		Concurrency:      concurrency,
 		ProvisionTimeout: reclaimAfter * 2 / 3, // must stay shorter than reclaim-after
@@ -68,8 +114,7 @@ func main() {
 	if err != nil {
 		log.Fatal("create worker", zap.Error(err))
 	}
-	// Probe endpoint so Kubernetes can tell whether the process is alive
-	// and the database is reachable.
+
 	if healthAddr != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /healthz", func(rw http.ResponseWriter, r *http.Request) {
@@ -90,10 +135,6 @@ func main() {
 		defer hs.Close()
 	}
 
-	// Run returns after ctx is cancelled (SIGINT/SIGTERM) and in-flight
-	// jobs have returned. Interrupted jobs stay in provisioning and are
-	// reclaimed by any worker after reclaim-after.
 	w.Run(ctx)
 	log.Info("worker exited")
-
 }

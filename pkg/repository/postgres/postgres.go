@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -138,4 +140,44 @@ func mapErr(err error) error {
 		}
 	}
 	return err
+}
+
+// ClaimPending atomically claims up to limit rows. SKIP LOCKED lets several
+// workers poll at once without ever receiving the same row.
+// Staleness is judged with the database clock (now()), not the app's.
+func (s *Store) ClaimPending(ctx context.Context, limit int, reclaimAfter time.Duration) ([]database.Database, error) {
+	rows, err := s.pool.Query(ctx, `
+		UPDATE databases
+		SET status = 'provisioning', status_reason = '', updated_at = now()
+		WHERE id IN (
+			SELECT id FROM databases
+			WHERE status = 'pending'
+			   OR ($2::float8 > 0
+			       AND status = 'provisioning'
+			       AND updated_at < now() - make_interval(secs => $2::float8))
+			ORDER BY created_at, id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING `+columns, limit, reclaimAfter.Seconds())
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+
+	out := make([]database.Database, 0, limit)
+	for rows.Next() {
+		db, err := scan(rows)
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, db)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, mapErr(err)
+	}
+
+	// RETURNING does not guarantee order
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
 }

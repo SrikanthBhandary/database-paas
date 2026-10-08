@@ -5,7 +5,7 @@ DATABASE_URL ?= postgres://paas:paas@localhost:5432/paas?sslmode=disable
 GOOSE        ?= go run github.com/pressly/goose/v3/cmd/goose@latest
 MIGRATIONS   ?= deploy/migrations
 COMPOSE ?= docker compose -f deploy/docker-compose.yml
-GO_DIR ?= api
+GO_DIR ?=.
 COVER_OUT ?= $(CURDIR)/coverage.out
 
 
@@ -111,7 +111,7 @@ minio-console: ## port-forward the MinIO console to localhost:9001
 # ---- Go ----
 .PHONY: run
 run: ## run the API server
-	go -C $(GO_DIR) run . -port $(PORT)
+	go -C $(GO_DIR) run ./cmd/api/ -port $(PORT)
 
 .PHONY: build
 build: ## build the binary into bin/

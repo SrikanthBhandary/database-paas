@@ -78,3 +78,38 @@ func (s *Store) UpdateStatus(_ context.Context, id string, status database.Statu
 	s.items[id] = db
 	return nil
 }
+
+// ClaimPending moves up to limit pending rows (oldest first) to provisioning
+// and returns them. Rows stuck in provisioning for reclaimAfter or longer are
+// taken again, which recovers from a crashed worker. reclaimAfter <= 0
+// disables reclaiming.
+func (s *Store) ClaimPending(_ context.Context, limit int, reclaimAfter time.Duration) ([]database.Database, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	var eligible []database.Database
+	for _, db := range s.items {
+		stale := reclaimAfter > 0 &&
+			db.Status == database.StatusProvisioning &&
+			now.Sub(db.UpdatedAt) >= reclaimAfter
+		if db.Status == database.StatusPending || stale {
+			eligible = append(eligible, db)
+		}
+	}
+
+	sort.Slice(eligible, func(i, j int) bool {
+		return eligible[i].CreatedAt.Before(eligible[j].CreatedAt)
+	})
+	if limit < len(eligible) {
+		eligible = eligible[:limit]
+	}
+
+	for i := range eligible {
+		eligible[i].Status = database.StatusProvisioning
+		eligible[i].StatusReason = ""
+		eligible[i].UpdatedAt = now
+		s.items[eligible[i].ID] = eligible[i]
+	}
+	return eligible, nil
+}

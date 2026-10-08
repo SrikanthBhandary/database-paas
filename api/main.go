@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"db-paas/pkg/server"
 	"errors"
 	"flag"
 	"net/http"
@@ -11,25 +10,58 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+
+	"db-paas/pkg/repository/memory"
+	"db-paas/pkg/repository/postgres"
+	"db-paas/pkg/server"
+	"db-paas/pkg/service"
 )
 
 func main() {
-	var port string
-	var timeout int
+	var (
+		port    string
+		dbURL   string
+		timeout int
+	)
 	flag.StringVar(&port, "port", "8000", "port in which server should run")
+	flag.StringVar(&dbURL, "database-url", os.Getenv("DATABASE_URL"),
+		"Postgres connection string (default: $DATABASE_URL; empty = in-memory store)")
 	flag.IntVar(&timeout, "timeout", 10, "graceful shutdown timeout in seconds")
-
 	flag.Parse()
+
+	if timeout <= 0 {
+		os.Stderr.WriteString("timeout must be greater than 0\n")
+		os.Exit(2)
+	}
 
 	log, err := zap.NewProduction()
 	if err != nil {
 		panic(err)
 	}
-
 	defer log.Sync()
 
-	api := server.NewAPIServer()
+	// ---- store ----
+	var store service.Store
+	if dbURL == "" {
+		log.Warn("no database URL set; using the in-memory store (data is lost on exit)")
+		store = memory.New()
+	} else {
+		pool, err := pgxpool.New(context.Background(), dbURL)
+		if err != nil {
+			log.Fatal("connect to database", zap.Error(err))
+		}
+		defer pool.Close() // runs after Shutdown below, so in-flight queries finish first
+
+		if err := pool.Ping(context.Background()); err != nil {
+			log.Fatal("ping database", zap.Error(err))
+		}
+		store = postgres.New(pool)
+	}
+
+	// ---- http ----
+	api := server.NewAPIServer(service.New(store), log)
 	api.RegisterAPI()
 
 	handler := server.LoggingMiddleware(log)(api.Router)

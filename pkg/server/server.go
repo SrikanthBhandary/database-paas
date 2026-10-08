@@ -29,4 +29,5 @@ func (as *APIServer) RegisterAPI() {
 	as.Router.Handle("POST "+v1+"/databases", owner(http.HandlerFunc(as.createDatabase)))
 	as.Router.Handle("GET "+v1+"/databases", owner(http.HandlerFunc(as.listDatabases)))
 	as.Router.Handle("GET "+v1+"/databases/{id}", owner(http.HandlerFunc(as.getDatabase)))
+	as.Router.Handle("PATCH "+v1+"/databases/{id}", owner(http.HandlerFunc(as.updateDatabase)))
 }

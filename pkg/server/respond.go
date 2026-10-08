@@ -87,6 +87,8 @@ func (as *APIServer) writeError(w http.ResponseWriter, r *http.Request, err erro
 		writeProblem(w, http.StatusNotFound, "database not found", nil)
 	case errors.Is(err, database.ErrAlreadyExists):
 		writeProblem(w, http.StatusConflict, "a database with this name already exists", nil)
+	case errors.Is(err, database.ErrInvalidState):
+		writeProblem(w, http.StatusConflict, "operation not allowed in the database's current state", nil)
 	default:
 		as.log.Error("request failed",
 			zap.String("method", r.Method), zap.String("path", r.URL.Path), zap.Error(err))

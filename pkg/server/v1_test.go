@@ -6,10 +6,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"db-paas/pkg/database"
 	"db-paas/pkg/repository/memory"
 	"db-paas/pkg/service"
 )
@@ -256,5 +258,109 @@ func TestInfraEndpointsNeedNoOwner(t *testing.T) {
 		if rec := do(t, h, "GET", path, "", ""); rec.Code != http.StatusOK {
 			t.Errorf("%s status = %d, want 200", path, rec.Code)
 		}
+	}
+}
+
+func TestGet_ConnectionOnlyWhenReady(t *testing.T) {
+	store := memory.New()
+	api := NewAPIServer(service.New(store), zap.NewNop())
+	api.RegisterAPI()
+	h := api.Router
+
+	created := mustCreate(t, h, "alice", validBody)
+	if created.Connection != nil {
+		t.Fatalf("connection = %+v while pending, want none", created.Connection)
+	}
+
+	// do what the worker does
+	claimed, _ := store.ClaimPending(t.Context(), 1, time.Hour)
+	conn := database.Connection{Host: "orders-rw.tenant-x.svc", Port: 5432, Database: "app", Username: "app",
+		SecretNamespace: "tenant-x", SecretName: "orders-app"}
+	if err := store.MarkReady(t.Context(), claimed[0].ID, conn); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	rec := do(t, h, "GET", "/v1/databases/"+created.ID, "alice", "")
+	got := decode[databaseResponse](t, rec)
+	if got.Status != "ready" || got.Connection == nil ||
+		got.Connection.Host != conn.Host || got.Connection.Port != 5432 ||
+		got.Connection.Database != "app" || got.Connection.Username != "app" {
+		t.Errorf("got %+v", got)
+	}
+	if strings.Contains(rec.Body.String(), "orders-app") || strings.Contains(rec.Body.String(), "tenant-x") && strings.Contains(rec.Body.String(), "secret") {
+		t.Errorf("secret reference leaked: %s", rec.Body)
+	}
+}
+
+func TestPatch(t *testing.T) {
+	store := memory.New()
+	api := NewAPIServer(service.New(store), zap.NewNop())
+	api.RegisterAPI()
+	h := api.Router
+
+	created := mustCreate(t, h, "alice", validBody)
+	path := "/v1/databases/" + created.ID
+
+	// still pending: not allowed yet
+	if rec := do(t, h, "PATCH", path, "alice", `{"cpu_millicores":1000}`); rec.Code != http.StatusConflict {
+		t.Fatalf("pending: status = %d, want 409", rec.Code)
+	}
+
+	// walk it to ready, as the worker would
+	claimed, _ := store.ClaimPending(t.Context(), 1, time.Hour)
+	if err := store.MarkReady(t.Context(), claimed[0].ID, database.Connection{Host: "h"}); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	// invalid values: 400 with field errors (these numbers assume the small plan's limits)
+	rec := do(t, h, "PATCH", path, "alice", `{"cpu_millicores":999999,"replicas":0}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid: status = %d, want 400; body %s", rec.Code, rec.Body)
+	}
+	p := decode[Problem](t, rec)
+	if _, ok := p.Errors["cpu_millicores"]; !ok {
+		t.Errorf("missing cpu_millicores error: %+v", p.Errors)
+	}
+	if _, ok := p.Errors["replicas"]; !ok {
+		t.Errorf("missing replicas error: %+v", p.Errors)
+	}
+
+	// unknown and forbidden fields are rejected
+	for _, body := range []string{`{"status":"ready"}`, `{"name":"renamed"}`, `{"engine":"mysql"}`} {
+		if rec := do(t, h, "PATCH", path, "alice", body); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", body, rec.Code)
+		}
+	}
+
+	// another owner sees 404
+	if rec := do(t, h, "PATCH", path, "bob", `{"cpu_millicores":1000}`); rec.Code != http.StatusNotFound {
+		t.Errorf("other owner: status = %d, want 404", rec.Code)
+	}
+
+	// a patch that changes nothing: 200, no work queued
+	rec = do(t, h, "PATCH", path, "alice", `{"cpu_millicores":500}`) // the small plan's default
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-op: status = %d, want 200; body %s", rec.Code, rec.Body)
+	}
+	if got := decode[databaseResponse](t, rec); got.Status != "ready" {
+		t.Errorf("no-op status = %q, want ready", got.Status)
+	}
+
+	// a real change: 202 + update_pending
+	rec = do(t, h, "PATCH", path, "alice", `{"cpu_millicores":1000,"memory_mb":2048}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("update: status = %d, want 202; body %s", rec.Code, rec.Body)
+	}
+	got := decode[databaseResponse](t, rec)
+	if got.Status != "update_pending" || got.Resources.CPUMillicores != 1000 || got.Resources.MemoryMB != 2048 {
+		t.Errorf("got %+v", got)
+	}
+	if loc := rec.Header().Get("Location"); loc != path {
+		t.Errorf("location = %q, want %q", loc, path)
+	}
+
+	// a second change while the first is queued
+	if rec := do(t, h, "PATCH", path, "alice", `{"cpu_millicores":900}`); rec.Code != http.StatusConflict {
+		t.Errorf("concurrent update: status = %d, want 409", rec.Code)
 	}
 }

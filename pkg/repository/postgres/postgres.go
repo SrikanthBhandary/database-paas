@@ -28,25 +28,31 @@ const columns = `id::text, name, engine, version, plan, status, status_reason, o
 	replicas,
 	autoscale_enabled, autoscale_max_storage_gb,
 	backup_enabled, backup_schedule, backup_retention_days,
+	connection_host, connection_port, connection_database, connection_username,
+	credentials_secret_namespace, credentials_secret_name,
 	created_at, updated_at`
 
 func (s *Store) Create(ctx context.Context, db database.Database) error {
 	_, err := s.pool.Exec(
 		ctx,
 		`INSERT INTO databases (
-			id, name, engine, version, plan, status, status_reason, owner_id,
-			cpu_millicores, memory_mb, storage_gb,
-			replicas,
-			autoscale_enabled, autoscale_max_storage_gb,
-			backup_enabled, backup_schedule, backup_retention_days,
-			created_at, updated_at
-		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+				id, name, engine, version, plan, status, status_reason, owner_id,
+				cpu_millicores, memory_mb, storage_gb,
+				replicas,
+				autoscale_enabled, autoscale_max_storage_gb,
+				backup_enabled, backup_schedule, backup_retention_days,
+				connection_host, connection_port, connection_database, connection_username,
+				credentials_secret_namespace, credentials_secret_name,
+				created_at, updated_at
+			)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		db.ID, db.Name, string(db.Engine), db.Version, db.Plan, string(db.Status), db.StatusReason, db.OwnerID,
 		db.Resources.CPUMillicores, db.Resources.MemoryMB, db.Resources.StorageGB,
 		db.Replicas,
 		db.Autoscale.Enabled, db.Autoscale.MaxStorageGB,
 		db.Backup.Enabled, db.Backup.Schedule, db.Backup.RetentionDays,
+		db.Connection.Host, db.Connection.Port, db.Connection.Database, db.Connection.Username,
+		db.Connection.SecretNamespace, db.Connection.SecretName,
 		db.CreatedAt, db.UpdatedAt,
 	)
 	return mapErr(err)
@@ -109,6 +115,8 @@ func scan(row pgx.Row) (database.Database, error) {
 		&db.Replicas,
 		&db.Autoscale.Enabled, &db.Autoscale.MaxStorageGB,
 		&db.Backup.Enabled, &db.Backup.Schedule, &db.Backup.RetentionDays,
+		&db.Connection.Host, &db.Connection.Port, &db.Connection.Database, &db.Connection.Username,
+		&db.Connection.SecretNamespace, &db.Connection.SecretName,
 		&db.CreatedAt, &db.UpdatedAt,
 	)
 	if err != nil {
@@ -148,13 +156,18 @@ func mapErr(err error) error {
 func (s *Store) ClaimPending(ctx context.Context, limit int, reclaimAfter time.Duration) ([]database.Database, error) {
 	rows, err := s.pool.Query(ctx, `
 		UPDATE databases
-		SET status = 'provisioning', status_reason = '', updated_at = now()
+		SET status = CASE status
+				        WHEN 'pending'        THEN 'provisioning'
+				        WHEN 'update_pending' THEN 'updating'
+				        ELSE status
+				    END,
+				    status_reason = '', updated_at = now()
 		WHERE id IN (
 			SELECT id FROM databases
-			WHERE status = 'pending'
-			   OR ($2::float8 > 0
-			       AND status = 'provisioning'
-			       AND updated_at < now() - make_interval(secs => $2::float8))
+			WHERE status IN ('pending', 'update_pending')
+			  OR ($2::float8 > 0
+					AND status IN ('provisioning', 'updating')
+					AND updated_at < now() - make_interval(secs => $2::float8))
 			ORDER BY created_at, id
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
@@ -180,4 +193,62 @@ func (s *Store) ClaimPending(ctx context.Context, limit int, reclaimAfter time.D
 	// RETURNING does not guarantee order
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+// MarkReady records the connection details and flips provisioning -> ready in
+// one statement. The status guard means a late result from a worker whose row
+// was reclaimed (or deleted) cannot overwrite newer state; that case returns
+// ErrInvalidState.
+func (s *Store) MarkReady(ctx context.Context, id string, c database.Connection) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE databases SET
+			status = 'ready', status_reason = '',
+			connection_host = $2, connection_port = $3,
+			connection_database = $4, connection_username = $5,
+			credentials_secret_namespace = $6, credentials_secret_name = $7,
+			updated_at = now()
+		WHERE id = $1 AND status IN ('provisioning', 'updating')`,
+		id, c.Host, c.Port, c.Database, c.Username, c.SecretNamespace, c.SecretName)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return database.ErrInvalidState
+	}
+	return nil
+}
+
+func (s *Store) MarkFailed(ctx context.Context, id, reason string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE databases SET
+			status = CASE status WHEN 'updating' THEN 'update_failed' ELSE 'failed' END,
+			status_reason = $2, updated_at = now()
+		WHERE id = $1 AND status IN ('provisioning', 'updating')`, id, reason)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return database.ErrInvalidState
+	}
+	return nil
+}
+
+func (s *Store) UpdateSpec(ctx context.Context, id string, expectedUpdatedAt time.Time, spec database.Spec) (database.Database, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE databases SET
+			plan = $3, cpu_millicores = $4, memory_mb = $5, storage_gb = $6, replicas = $7,
+			status = 'update_pending', status_reason = '', updated_at = now()
+		WHERE id = $1 AND updated_at = $2 AND status IN ('ready', 'update_failed')
+		RETURNING `+columns,
+		id, expectedUpdatedAt, spec.Plan,
+		spec.Resources.CPUMillicores, spec.Resources.MemoryMB, spec.Resources.StorageGB, spec.Replicas)
+
+	db, err := scan(row)
+	if errors.Is(err, pgx.ErrNoRows) { // checked before mapErr, which would call this "not found"
+		return database.Database{}, database.ErrInvalidState
+	}
+	if err != nil {
+		return database.Database{}, mapErr(err)
+	}
+	return db, nil
 }

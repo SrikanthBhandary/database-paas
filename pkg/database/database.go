@@ -2,7 +2,24 @@ package database
 
 import "time"
 
+type Status string
 type Engine string
+
+const (
+	EnginePostgres Engine = "postgres"
+	EngineMySQL    Engine = "mysql"
+)
+
+const (
+	StatusPending       Status = "pending"
+	StatusProvisioning  Status = "provisioning"
+	StatusReady         Status = "ready"
+	StatusFailed        Status = "failed"
+	StatusDeleting      Status = "deleting"
+	StatusUpdatePending Status = "update_pending" // change accepted, waiting for a worker
+	StatusUpdating      Status = "updating"       // a worker is applying it
+	StatusUpdateFailed  Status = "update_failed"  // did not apply; PATCH again to retry
+)
 
 func (e Engine) Valid() bool {
 	return e == EnginePostgres || e == EngineMySQL
@@ -10,26 +27,20 @@ func (e Engine) Valid() bool {
 
 func (s Status) Valid() bool {
 	switch s {
-	case StatusPending, StatusProvisioning, StatusReady, StatusFailed, StatusDeleting:
+	case StatusPending, StatusProvisioning, StatusReady, StatusFailed, StatusDeleting,
+		StatusUpdatePending, StatusUpdating, StatusUpdateFailed:
 		return true
 	}
 	return false
 }
 
-const (
-	EnginePostgres Engine = "postgres"
-	EngineMySQL    Engine = "mysql"
-)
+// Spec is the part of a database a client can change after creation.
+type Spec struct {
+	Plan      string
+	Resources Resources
+	Replicas  int
+}
 
-type Status string
-
-const (
-	StatusPending      Status = "pending"
-	StatusProvisioning Status = "provisioning"
-	StatusReady        Status = "ready"
-	StatusFailed       Status = "failed"
-	StatusDeleting     Status = "deleting"
-)
 
 type Database struct {
 	ID           string
@@ -44,6 +55,7 @@ type Database struct {
 	Resources    Resources
 	Autoscale    Autoscale // This is to autoscale the database size
 	Backup       Backup
+	Connection   Connection
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
@@ -63,4 +75,20 @@ type Backup struct {
 	Enabled       bool
 	Schedule      string // cron expression, e.g. "0 2 * * *"
 	RetentionDays int
+}
+
+// Connection says where a ready database can be reached. It is empty until
+// provisioning finishes. It never contains a password: the secret is only
+// referenced, so credentials stay in Kubernetes.
+type Connection struct {
+	Host            string
+	Port            int
+	Database        string
+	Username        string
+	SecretNamespace string // where the credentials live
+	SecretName      string
+}
+
+func (d Database) Spec() Spec {
+	return Spec{Plan: d.Plan, Resources: d.Resources, Replicas: d.Replicas}
 }

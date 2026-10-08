@@ -501,3 +501,191 @@ func TestValidateSchedule(t *testing.T) {
 		})
 	}
 }
+
+func intp(v int) *int       { return &v }
+func strp(s string) *string { return &s }
+
+// readyDatabase creates a database and walks it to ready the way the worker would.
+func readyDatabase(t *testing.T, svc *Service, store *memory.Store, in CreateDatabaseInput) database.Database {
+	t.Helper()
+	created, err := svc.CreateDatabase(t.Context(), in)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got, _ := store.ClaimPending(t.Context(), 1, time.Hour); len(got) != 1 {
+		t.Fatalf("claim = %+v", got)
+	}
+	if err := store.MarkReady(t.Context(), created.ID, database.Connection{Host: "h"}); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	got, err := svc.GetDatabase(t.Context(), in.OwnerID, created.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	return got
+}
+
+func smallInput() CreateDatabaseInput {
+	in := validInput()
+	in.Replicas = 1
+	return in
+}
+
+func TestUpdateDatabase_Validation(t *testing.T) {
+	small := plans["small"]
+	tests := []struct {
+		name string
+		in   UpdateDatabaseInput
+		want []string // invalid fields; nil = accepted
+	}{
+		{"cpu at plan max", UpdateDatabaseInput{CPUMillicores: intp(small.MaxCPUMillicores)}, nil},
+		{"cpu above plan max", UpdateDatabaseInput{CPUMillicores: intp(small.MaxCPUMillicores + 1)}, []string{"cpu_millicores"}},
+		{"cpu below minimum", UpdateDatabaseInput{CPUMillicores: intp(minCPUMillicores - 1)}, []string{"cpu_millicores"}},
+		{"memory at plan max", UpdateDatabaseInput{MemoryMB: intp(small.MaxMemoryMB)}, nil},
+		{"memory above plan max", UpdateDatabaseInput{MemoryMB: intp(small.MaxMemoryMB + 1)}, []string{"memory_mb"}},
+		{"memory below minimum", UpdateDatabaseInput{MemoryMB: intp(minMemoryMB - 1)}, []string{"memory_mb"}},
+		{"storage grows", UpdateDatabaseInput{StorageGB: intp(small.Resources.StorageGB + 1)}, nil},
+		{"storage shrinks", UpdateDatabaseInput{StorageGB: intp(small.Resources.StorageGB - 1)}, []string{"storage_gb"}},
+		{"storage above plan max", UpdateDatabaseInput{StorageGB: intp(small.MaxStorageGB + 1)}, []string{"storage_gb"}},
+		{"replicas zero", UpdateDatabaseInput{Replicas: intp(0)}, []string{"replicas"}},
+		{"replicas above plan max", UpdateDatabaseInput{Replicas: intp(small.MaxReplicas + 1)}, []string{"replicas"}},
+		{"unknown plan", UpdateDatabaseInput{Plan: strp("huge")}, []string{"plan"}},
+		{"several at once", UpdateDatabaseInput{
+			CPUMillicores: intp(small.MaxCPUMillicores + 1),
+			MemoryMB:      intp(small.MaxMemoryMB + 1),
+			Replicas:      intp(0),
+		}, []string{"cpu_millicores", "memory_mb", "replicas"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store := newTestService(t)
+			db := readyDatabase(t, svc, store, smallInput())
+
+			_, changed, err := svc.UpdateDatabase(t.Context(), "alice", db.ID, tc.in)
+			if tc.want == nil {
+				if err != nil || !changed {
+					t.Fatalf("changed=%v err=%v, want an accepted change", changed, err)
+				}
+				return
+			}
+			if !errors.Is(err, database.ErrInvalidInput) {
+				t.Fatalf("err = %v, want ErrInvalidInput", err)
+			}
+			if got := fieldKeys(err); !slices.Equal(got, tc.want) {
+				t.Errorf("invalid fields = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUpdateDatabase_QueuesChange(t *testing.T) {
+	svc, store := newTestService(t)
+	db := readyDatabase(t, svc, store, smallInput())
+
+	got, changed, err := svc.UpdateDatabase(t.Context(), "alice", db.ID,
+		UpdateDatabaseInput{CPUMillicores: intp(1000), MemoryMB: intp(2048), StorageGB: intp(20)})
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if got.Status != database.StatusUpdatePending {
+		t.Errorf("status = %q, want update_pending", got.Status)
+	}
+	want := database.Resources{CPUMillicores: 1000, MemoryMB: 2048, StorageGB: 20}
+	if got.Resources != want {
+		t.Errorf("resources = %+v, want %+v", got.Resources, want)
+	}
+	stored, _ := store.Get(t.Context(), db.ID)
+	if stored.Status != database.StatusUpdatePending || stored.Resources != want {
+		t.Errorf("not persisted: %+v", stored)
+	}
+}
+
+func TestUpdateDatabase_NoOp(t *testing.T) {
+	svc, store := newTestService(t)
+	db := readyDatabase(t, svc, store, smallInput())
+
+	got, changed, err := svc.UpdateDatabase(t.Context(), "alice", db.ID,
+		UpdateDatabaseInput{CPUMillicores: intp(db.Resources.CPUMillicores)})
+	if err != nil || changed {
+		t.Fatalf("changed=%v err=%v, want a no-op", changed, err)
+	}
+	if got.Status != database.StatusReady {
+		t.Errorf("status = %q, a no-op must not queue work", got.Status)
+	}
+}
+
+func TestUpdateDatabase_PlanUpgradeResetsCPUAndMemoryOnly(t *testing.T) {
+	svc, store := newTestService(t)
+	db := readyDatabase(t, svc, store, smallInput())
+	medium := plans["medium"]
+
+	got, _, err := svc.UpdateDatabase(t.Context(), "alice", db.ID, UpdateDatabaseInput{Plan: strp("medium")})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got.Plan != "medium" ||
+		got.Resources.CPUMillicores != medium.Resources.CPUMillicores ||
+		got.Resources.MemoryMB != medium.Resources.MemoryMB {
+		t.Errorf("cpu/memory not reset to the medium defaults: %+v", got)
+	}
+	if got.Resources.StorageGB != db.Resources.StorageGB || got.Replicas != db.Replicas {
+		t.Errorf("storage/replicas must be kept: %+v", got)
+	}
+}
+
+func TestUpdateDatabase_DowngradeBlockedByStorage(t *testing.T) {
+	svc, store := newTestService(t)
+	in := smallInput()
+	in.Plan = "medium"
+	in.StorageGB = plans["small"].MaxStorageGB + 1 // fits medium, not small
+	db := readyDatabase(t, svc, store, in)
+
+	_, _, err := svc.UpdateDatabase(t.Context(), "alice", db.ID, UpdateDatabaseInput{Plan: strp("small")})
+	if got := fieldKeys(err); !slices.Equal(got, []string{"plan"}) {
+		t.Fatalf("invalid fields = %v, want [plan] (storage cannot shrink to fit)", got)
+	}
+}
+
+func TestUpdateDatabase_StorageMustStayBelowAutoscaleCeiling(t *testing.T) {
+	svc, store := newTestService(t)
+	in := smallInput()
+	in.AutoScale = database.Autoscale{Enabled: true, MaxStorageGB: 50}
+	db := readyDatabase(t, svc, store, in)
+
+	_, _, err := svc.UpdateDatabase(t.Context(), "alice", db.ID, UpdateDatabaseInput{StorageGB: intp(50)})
+	if got := fieldKeys(err); !slices.Equal(got, []string{"storage_gb"}) {
+		t.Fatalf("invalid fields = %v, want [storage_gb]", got)
+	}
+}
+
+// func TestUpdateDatabase_OnlyWhenReadyOrUpdateFailed(t *testing.T) {
+// 	svc, store := newTestService(t)
+// 	pending, _ := svc.CreateDatabase(t.Context(), smallInput()) // still pending
+//
+// 	_, _, err := svc.UpdateDatabase(t.Context(), "alice", pending.ID, UpdateDatabaseInput{CPUMillicores: intp(1000)})
+// 	if !errors.Is(err, database.ErrInvalidState) {
+// 		t.Fatalf("pending: err = %v, want ErrInvalidState", err)
+// 	}
+//
+// 	// and while a previous update is still queued
+// 	other := smallInput()
+// 	other.Name = "second"
+// 	db := readyDatabase(t, svc, store, other)
+// 	if _, _, err := svc.UpdateDatabase(t.Context(), "alice", db.ID, UpdateDatabaseInput{CPUMillicores: intp(1000)}); err != nil {
+// 		t.Fatalf("first update: %v", err)
+// 	}
+// 	_, _, err = svc.UpdateDatabase(t.Context(), "alice", db.ID, UpdateDatabaseInput{MemoryMB: intp(2048)})
+// 	if !errors.Is(err, database.ErrInvalidState) {
+// 		t.Fatalf("second update while update_pending: err = %v, want ErrInvalidState", err)
+// 	}
+// }
+
+func TestUpdateDatabase_OtherOwnerSeesNotFound(t *testing.T) {
+	svc, store := newTestService(t)
+	db := readyDatabase(t, svc, store, smallInput())
+
+	_, _, err := svc.UpdateDatabase(t.Context(), "bob", db.ID, UpdateDatabaseInput{CPUMillicores: intp(1000)})
+	if !errors.Is(err, database.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}

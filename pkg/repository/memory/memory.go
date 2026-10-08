@@ -90,10 +90,11 @@ func (s *Store) ClaimPending(_ context.Context, limit int, reclaimAfter time.Dur
 	now := time.Now().UTC()
 	var eligible []database.Database
 	for _, db := range s.items {
+		queued := db.Status == database.StatusPending || db.Status == database.StatusUpdatePending
 		stale := reclaimAfter > 0 &&
-			db.Status == database.StatusProvisioning &&
+			(db.Status == database.StatusProvisioning || db.Status == database.StatusUpdating) &&
 			now.Sub(db.UpdatedAt) >= reclaimAfter
-		if db.Status == database.StatusPending || stale {
+		if queued || stale {
 			eligible = append(eligible, db)
 		}
 	}
@@ -106,10 +107,77 @@ func (s *Store) ClaimPending(_ context.Context, limit int, reclaimAfter time.Dur
 	}
 
 	for i := range eligible {
-		eligible[i].Status = database.StatusProvisioning
+		switch eligible[i].Status { // stale rows keep their in-progress status
+		case database.StatusPending:
+			eligible[i].Status = database.StatusProvisioning
+		case database.StatusUpdatePending:
+			eligible[i].Status = database.StatusUpdating
+		}
 		eligible[i].StatusReason = ""
 		eligible[i].UpdatedAt = now
 		s.items[eligible[i].ID] = eligible[i]
 	}
 	return eligible, nil
+}
+
+func (s *Store) MarkReady(_ context.Context, id string, c database.Connection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	db, ok := s.items[id]
+	if !ok || (db.Status != database.StatusProvisioning && db.Status != database.StatusUpdating) {
+		return database.ErrInvalidState
+	}
+	db.Status = database.StatusReady
+	db.StatusReason = ""
+	db.Connection = c
+	db.UpdatedAt = time.Now().UTC()
+	s.items[id] = db
+	return nil
+}
+
+// MarkFailed ends an in-progress operation: provisioning -> failed,
+// updating -> update_failed. Anything else is a stale result and is refused.
+func (s *Store) MarkFailed(_ context.Context, id, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	db, ok := s.items[id]
+	if !ok {
+		return database.ErrInvalidState
+	}
+	switch db.Status {
+	case database.StatusProvisioning:
+		db.Status = database.StatusFailed
+	case database.StatusUpdating:
+		db.Status = database.StatusUpdateFailed
+	default:
+		return database.ErrInvalidState
+	}
+	db.StatusReason = reason
+	db.UpdatedAt = time.Now().UTC()
+	s.items[id] = db
+	return nil
+}
+
+// UpdateSpec queues a change. It applies only if the row is still in the
+// state the caller validated against: ready or update_failed, with the same
+// updated_at. Otherwise the caller's checks are stale.
+func (s *Store) UpdateSpec(_ context.Context, id string, expectedUpdatedAt time.Time, spec database.Spec) (database.Database, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	db, ok := s.items[id]
+	if !ok || !db.UpdatedAt.Equal(expectedUpdatedAt) ||
+		(db.Status != database.StatusReady && db.Status != database.StatusUpdateFailed) {
+		return database.Database{}, database.ErrInvalidState
+	}
+	db.Plan = spec.Plan
+	db.Resources = spec.Resources
+	db.Replicas = spec.Replicas
+	db.Status = database.StatusUpdatePending
+	db.StatusReason = ""
+	db.UpdatedAt = time.Now().UTC()
+	s.items[id] = db
+	return db, nil
 }

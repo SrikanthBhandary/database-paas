@@ -1,0 +1,6 @@
+What this doesn't give users yet
+The host only resolves inside the cluster. orders2-rw.<ns>.svc works for apps running in Kubernetes. A customer connecting from their laptop or another cloud needs external exposure: a LoadBalancer or an ingress with TCP passthrough, TLS, and probably a connection pooler (CNPG supports PgBouncer via its Pooler resource). That's a significant piece of its own.
+There's no way to obtain the password. The usual shape is POST /v1/databases/{id}/credentials, which reads <name>-app from the stored secret reference, returns the password once over TLS, and is authenticated and audited. The reference you just stored is what makes that endpoint possible. Don't put the password in the GET response.
+UpdateStatus is still unguarded. MarkReady refuses to overwrite a row that isn't provisioning, but the failed path doesn't, so a late failure could still overwrite a newer state. The transition rules in the delete step close this gap.
+
+Next in the plan is DELETE with those transition rules. Want to start there?

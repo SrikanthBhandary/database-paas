@@ -27,11 +27,12 @@ type BackupStore struct {
 }
 
 type Config struct {
-	FieldManager string        // server-side-apply owner (default "db-paas")
-	ImageRepo    string        // default ghcr.io/cloudnative-pg/postgresql
-	StorageClass string        // empty = cluster default
-	PollInterval time.Duration // readiness poll (default 3s)
-	Backup       *BackupStore  // nil = backups unavailable
+	FieldManager      string        // server-side-apply owner (default "db-paas")
+	ImageRepo         string        // default ghcr.io/cloudnative-pg/postgresql
+	StorageClass      string        // empty = cluster default
+	PollInterval      time.Duration // readiness poll (default 3s)
+	Backup            *BackupStore  // nil = backups unavailable
+	UpdateStablePolls int           // consecutive healthy polls required after an update (default 5)
 }
 
 type Provisioner struct {
@@ -49,6 +50,11 @@ func New(client dynamic.Interface, cfg Config) *Provisioner {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 3 * time.Second
 	}
+	// in New(), alongside the other defaults
+	if cfg.UpdateStablePolls <= 0 {
+		cfg.UpdateStablePolls = 5
+	}
+
 	return &Provisioner{client: client, cfg: cfg}
 }
 
@@ -70,42 +76,50 @@ func RESTConfig(kubeconfig string) (*rest.Config, error) {
 // Provision creates everything for db and returns once the Cluster is
 // healthy. Every step is a server-side apply, so running it again after a
 // crash converges on the same objects instead of duplicating them.
-func (p *Provisioner) Provision(ctx context.Context, db database.Database) error {
+func (p *Provisioner) Provision(ctx context.Context, db database.Database) (database.Connection, error) {
 	if db.Engine != database.EnginePostgres {
-		return fmt.Errorf("engine %q is not supported by the cnpg provisioner", db.Engine)
+		return database.Connection{}, fmt.Errorf("engine %q is not supported by the cnpg provisioner", db.Engine)
 	}
 	if db.Backup.Enabled && p.cfg.Backup == nil {
-		return errors.New("backups are enabled but no backup store is configured")
+		return database.Connection{}, errors.New("backups are enabled but no backup store is configured")
 	}
 
 	ns := namespaceFor(db.OwnerID)
 	if err := p.checkOwnership(ctx, ns, db); err != nil {
-		return err
+		return database.Connection{}, err
 	}
 
 	if err := p.apply(ctx, gvrNamespace, "", namespaceManifest(ns, db.OwnerID)); err != nil {
-		return err
+		return database.Connection{}, err
 	}
 	if db.Backup.Enabled {
 		b := *p.cfg.Backup
 		if err := p.apply(ctx, gvrSecret, ns, backupSecretManifest(ns, b)); err != nil {
-			return err
+			return database.Connection{}, err
 		}
 		// the ObjectStore must exist before the Cluster that references it
 		if err := p.apply(ctx, gvrObjectStore, ns, objectStoreManifest(ns, db, b)); err != nil {
-			return err
+			return database.Connection{}, err
 		}
 	}
 	if err := p.apply(ctx, gvrCluster, ns, clusterManifest(ns, db, p.cfg)); err != nil {
-		return err
+		return database.Connection{}, err
 	}
 	if db.Backup.Enabled {
 		if err := p.apply(ctx, gvrScheduledBackup, ns, scheduledBackupManifest(ns, db)); err != nil {
-			return err
+			return database.Connection{}, err
 		}
 	}
 
-	return p.waitReady(ctx, ns, db.Name)
+	// in Provision, replace the final wait
+	polls := 1
+	if db.Status == database.StatusUpdating {
+		polls = p.cfg.UpdateStablePolls
+	}
+	if err := p.waitReady(ctx, ns, db.Name, polls); err != nil {
+		return database.Connection{}, err
+	}
+	return connectionFor(ns, db), nil
 }
 
 // checkOwnership refuses to adopt a Cluster that carries another database's ID.
@@ -138,26 +152,32 @@ func (p *Provisioner) apply(ctx context.Context, gvr schema.GroupVersionResource
 	return nil
 }
 
-func (p *Provisioner) waitReady(ctx context.Context, ns, name string) error {
+func (p *Provisioner) waitReady(ctx context.Context, ns, name string, stablePolls int) error {
 	ticker := time.NewTicker(p.cfg.PollInterval)
 	defer ticker.Stop()
 
 	var last string
+	streak := 0
 	for {
 		c, err := p.client.Resource(gvrCluster).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
-		if err == nil {
+		switch {
+		case err != nil:
+			streak = 0
+			last = "get cluster: " + err.Error() // transient: keep polling
+		default:
 			ready, summary := clusterStatus(c)
-			if ready {
-				return nil
-			}
 			last = summary
-		} else {
-			last = "get cluster: " + err.Error() // transient API errors: keep polling
+			if ready {
+				if streak++; streak >= stablePolls {
+					return nil
+				}
+			} else {
+				streak = 0
+			}
 		}
 
 		select {
 		case <-ctx.Done():
-			// %w keeps context.DeadlineExceeded visible to the worker
 			return fmt.Errorf("cluster %s/%s not ready (%s): %w", ns, name, last, ctx.Err())
 		case <-ticker.C:
 		}

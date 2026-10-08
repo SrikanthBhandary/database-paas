@@ -174,11 +174,22 @@ func TestProvisionRejectsEarly(t *testing.T) {
 
 	mysql := testDB()
 	mysql.Engine = database.EngineMySQL
-	if err := p.Provision(t.Context(), mysql); err == nil {
+	if _, err := p.Provision(t.Context(), mysql); err == nil {
 		t.Error("mysql should be rejected")
 	}
 
-	if err := p.Provision(t.Context(), testDB()); err == nil {
+	if _, err := p.Provision(t.Context(), testDB()); err == nil {
 		t.Error("backups enabled without a configured store should be rejected")
+	}
+}
+
+func TestConnectionFor(t *testing.T) {
+	c := connectionFor("tenant-abc", testDB())
+	want := database.Connection{
+		Host: "orders-rw.tenant-abc.svc", Port: 5432, Database: "app", Username: "app",
+		SecretNamespace: "tenant-abc", SecretName: "orders-app",
+	}
+	if c != want {
+		t.Errorf("got %+v, want %+v", c, want)
 	}
 }

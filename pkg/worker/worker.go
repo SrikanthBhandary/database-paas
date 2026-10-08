@@ -16,13 +16,15 @@ import (
 type Store interface {
 	ClaimPending(ctx context.Context, limit int, reclaimAfter time.Duration) ([]database.Database, error)
 	UpdateStatus(ctx context.Context, id string, status database.Status, reason string) error
+	MarkReady(ctx context.Context, id string, c database.Connection) error
+	MarkFailed(ctx context.Context, id, reason string) error
 }
 
 // Provisioner creates the real database. It blocks until the database is
 // ready or fails, and it must be idempotent: after a crash the same row can
 // be provisioned again.
 type Provisioner interface {
-	Provision(ctx context.Context, db database.Database) error
+	Provision(ctx context.Context, db database.Database) (database.Connection, error)
 }
 
 type Config struct {
@@ -119,39 +121,58 @@ func (w *Worker) poll(ctx context.Context) {
 		})
 	}
 }
-
 func (w *Worker) process(ctx context.Context, db database.Database) {
-	log := w.log.With(zap.String("database_id", db.ID), zap.String("name", db.Name))
-	log.Info("provisioning")
+	op := "provisioning"
+	if db.Status == database.StatusUpdating { // the claim already moved update_pending -> updating
+		op = "update"
+	}
+	log := w.log.With(zap.String("database_id", db.ID), zap.String("name", db.Name), zap.String("operation", op))
+	log.Info("started")
 
 	pctx, cancel := context.WithTimeout(ctx, w.cfg.ProvisionTimeout)
 	defer cancel()
-	err := w.prov.Provision(pctx, db)
+	conn, err := w.prov.Provision(pctx, db) // idempotent: the same call creates or updates
 
-	// Status writes must still happen while shutting down, so they use a
-	// context that ignores ctx's cancellation.
 	wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer wcancel()
 
 	switch {
 	case err == nil:
-		w.setStatus(wctx, log, db.ID, database.StatusReady, "")
-		log.Info("database ready")
+		w.markReady(wctx, log, db.ID, conn)
 
 	case ctx.Err() != nil:
-		// Shutting down, so this failure is not the database's fault. Leave it in
-		// provisioning; it is reclaimed after ReclaimAfter.
-		log.Warn("provisioning interrupted by shutdown", zap.Error(err))
+		log.Warn("interrupted by shutdown", zap.Error(err))
 
 	default:
-		// status_reason is returned to API clients, so it must never carry
-		// internals. The real error goes to the log.
-		reason := "provisioning failed"
+		reason := op + " failed" // client-visible, so never the raw error
 		if errors.Is(err, context.DeadlineExceeded) {
-			reason = "provisioning timed out"
+			reason = op + " timed out"
 		}
-		log.Error("provisioning failed", zap.Error(err))
-		w.setStatus(wctx, log, db.ID, database.StatusFailed, reason)
+		log.Error("failed", zap.Error(err))
+		w.markFailed(wctx, log, db.ID, reason)
+	}
+}
+
+func (w *Worker) markFailed(ctx context.Context, log *zap.Logger, id, reason string) {
+	err := w.store.MarkFailed(ctx, id, reason)
+	switch {
+	case err == nil:
+	case errors.Is(err, database.ErrInvalidState):
+		log.Warn("failure discarded: row is no longer in progress")
+	default:
+		log.Error("mark failed", zap.Error(err)) // stays in progress; reclaimed later
+	}
+}
+
+func (w *Worker) markReady(ctx context.Context, log *zap.Logger, id string, conn database.Connection) {
+	err := w.store.MarkReady(ctx, id, conn)
+	switch {
+	case err == nil:
+		log.Info("database ready", zap.String("host", conn.Host))
+	case errors.Is(err, database.ErrInvalidState):
+		log.Warn("result discarded: row is no longer provisioning (reclaimed by another worker, or deleted)")
+	default:
+		log.Error("mark ready", zap.Error(err)) // stays provisioning; reclaimed later
 	}
 }
 

@@ -35,20 +35,30 @@ type resourcesDTO struct {
 	StorageGB     int `json:"storage_gb"`
 }
 
+// A merge patch: omitted fields are left unchanged.
+type updateDatabaseRequest struct {
+	Plan          *string `json:"plan"`
+	Replicas      *int    `json:"replicas"`
+	CPUMillicores *int    `json:"cpu_millicores"`
+	MemoryMB      *int    `json:"memory_mb"`
+	StorageGB     *int    `json:"storage_gb"`
+}
+
 type databaseResponse struct {
-	ID           string       `json:"id"`
-	Name         string       `json:"name"`
-	Engine       string       `json:"engine"`
-	Version      string       `json:"version"`
-	Plan         string       `json:"plan"`
-	Status       string       `json:"status"`
-	StatusReason string       `json:"status_reason,omitempty"`
-	Resources    resourcesDTO `json:"resources"`
-	Replicas     int          `json:"replicas"`
-	Autoscale    autoscaleDTO `json:"autoscale"`
-	Backup       backupDTO    `json:"backup"`
-	CreatedAt    time.Time    `json:"created_at"`
-	UpdatedAt    time.Time    `json:"updated_at"`
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	Engine       string         `json:"engine"`
+	Version      string         `json:"version"`
+	Plan         string         `json:"plan"`
+	Status       string         `json:"status"`
+	StatusReason string         `json:"status_reason,omitempty"`
+	Resources    resourcesDTO   `json:"resources"`
+	Replicas     int            `json:"replicas"`
+	Autoscale    autoscaleDTO   `json:"autoscale"`
+	Backup       backupDTO      `json:"backup"`
+	Connection   *connectionDTO `json:"connection,omitempty"` // present once ready
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
 }
 
 // A wrapper object (not a bare array) so pagination can be added later
@@ -84,7 +94,7 @@ func (req createDatabaseRequest) toInput(ownerID string) service.CreateDatabaseI
 }
 
 func toResponse(db database.Database) databaseResponse {
-	return databaseResponse{
+	resp := databaseResponse{
 		ID:           db.ID,
 		Name:         db.Name,
 		Engine:       string(db.Engine),
@@ -107,6 +117,15 @@ func toResponse(db database.Database) databaseResponse {
 		CreatedAt: db.CreatedAt,
 		UpdatedAt: db.UpdatedAt,
 	}
+	if db.Connection.Host != "" {
+			resp.Connection = &connectionDTO{
+				Host:     db.Connection.Host,
+				Port:     db.Connection.Port,
+				Database: db.Connection.Database,
+				Username: db.Connection.Username,
+			}
+	}
+	return resp
 }
 
 func toListResponse(dbs []database.Database) listDatabasesResponse {
@@ -115,4 +134,19 @@ func toListResponse(dbs []database.Database) listDatabasesResponse {
 		out = append(out, toResponse(db))
 	}
 	return listDatabasesResponse{Databases: out}
+}
+
+type connectionDTO struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Database string `json:"database"`
+	Username string `json:"username"`
+}
+
+
+func (req updateDatabaseRequest) toInput() service.UpdateDatabaseInput {
+	return service.UpdateDatabaseInput{
+		Plan: req.Plan, Replicas: req.Replicas,
+		CPUMillicores: req.CPUMillicores, MemoryMB: req.MemoryMB, StorageGB: req.StorageGB,
+	}
 }

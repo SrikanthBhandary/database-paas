@@ -41,3 +41,24 @@ func (as *APIServer) listDatabases(w http.ResponseWriter, r *http.Request) {
 	}
 	as.writeJSON(w, http.StatusOK, toListResponse(dbs))
 }
+
+// PATCH /v1/databases/{id}: 202 if a change was queued, 200 if it was a no-op.
+func (as *APIServer) updateDatabase(w http.ResponseWriter, r *http.Request) {
+	var req updateDatabaseRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+
+	db, changed, err := as.svc.UpdateDatabase(r.Context(), ownerFrom(r.Context()), r.PathValue("id"), req.toInput())
+	if err != nil {
+		as.writeError(w, r, err)
+		return
+	}
+	if !changed {
+		as.writeJSON(w, http.StatusOK, toResponse(db))
+		return
+	}
+	w.Header().Set("Location", v1+"/databases/"+db.ID)
+	as.writeJSON(w, http.StatusAccepted, toResponse(db))
+}

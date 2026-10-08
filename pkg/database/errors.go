@@ -9,6 +9,7 @@ var (
 	ErrNotFound      = errors.New("database not found")
 	ErrAlreadyExists = errors.New("database already exists")
 	ErrInvalidInput  = errors.New("invalid input")
+	ErrInvalidState  = errors.New("operation not allowed in the current state")
 )
 
 type ValidationError struct {

@@ -12,11 +12,14 @@ import (
 )
 
 const (
-	labelManagedBy  = "app.kubernetes.io/managed-by"
-	labelDatabaseID = "paas.db/database-id"
-	labelTenant     = "paas.db/tenant"
-	annotationOwner = "paas.db/owner"
-	managedByValue  = "db-paas"
+	pgPort            = 5432
+	bootstrapDatabase = "app" // CNPG's default initdb database...
+	bootstrapUser     = "app" // ...and its owner
+	labelManagedBy    = "app.kubernetes.io/managed-by"
+	labelDatabaseID   = "paas.db/database-id"
+	labelTenant       = "paas.db/tenant"
+	annotationOwner   = "paas.db/owner"
+	managedByValue    = "db-paas"
 
 	pluginName       = "barman-cloud.cloudnative-pg.io"
 	backupSecretName = "backup-s3"
@@ -169,4 +172,18 @@ func hasReadyCondition(c *unstructured.Unstructured) bool {
 		}
 	}
 	return false
+}
+
+// connectionFor describes how to reach the cluster from inside Kubernetes.
+// CNPG publishes the read-write service as <cluster>-rw and the generated
+// credentials as the secret <cluster>-app.
+func connectionFor(ns string, db database.Database) database.Connection {
+	return database.Connection{
+		Host:            fmt.Sprintf("%s-rw.%s.svc", db.Name, ns),
+		Port:            pgPort,
+		Database:        bootstrapDatabase,
+		Username:        bootstrapUser,
+		SecretNamespace: ns,
+		SecretName:      db.Name + "-app",
+	}
 }

@@ -300,3 +300,105 @@ func TestCreateNegativeReplicas(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidInput", err)
 	}
 }
+
+func TestMarkReady(t *testing.T) {
+	s := newStore(t)
+	in := newDB("alice", "orders")
+	_ = s.Create(t.Context(), in)
+	if got, _ := s.ClaimPending(t.Context(), 1, time.Hour); len(got) != 1 {
+		t.Fatalf("claim = %+v", got)
+	}
+
+	conn := database.Connection{Host: "orders-rw.tenant-x.svc", Port: 5432, Database: "app", Username: "app",
+		SecretNamespace: "tenant-x", SecretName: "orders-app"}
+	if err := s.MarkReady(t.Context(), in.ID, conn); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	got, err := s.Get(t.Context(), in.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != database.StatusReady || got.StatusReason != "" || got.Connection != conn {
+		t.Errorf("got status=%q connection=%+v", got.Status, got.Connection)
+	}
+}
+
+func TestMarkReadyRequiresProvisioning(t *testing.T) {
+	s := newStore(t)
+	in := newDB("alice", "orders") // pending
+	_ = s.Create(t.Context(), in)
+
+	for name, id := range map[string]string{
+		"pending row": in.ID,
+		"unknown id":  uuid.NewString(),
+	} {
+		if err := s.MarkReady(t.Context(), id, database.Connection{}); !errors.Is(err, database.ErrInvalidState) {
+			t.Errorf("%s: err = %v, want ErrInvalidState", name, err)
+		}
+	}
+}
+
+func TestUpdateLifecycle(t *testing.T) {
+	s := newStore(t)
+	in := newDB("alice", "orders")
+	in.Status = database.StatusReady
+	_ = s.Create(t.Context(), in)
+
+	spec := database.Spec{
+		Plan:      "medium",
+		Resources: database.Resources{CPUMillicores: 2000, MemoryMB: 4096, StorageGB: 50},
+		Replicas:  3,
+	}
+
+	// stale version is refused
+	if _, err := s.UpdateSpec(t.Context(), in.ID, in.UpdatedAt.Add(-time.Second), spec); !errors.Is(err, database.ErrInvalidState) {
+		t.Fatalf("stale version: err = %v, want ErrInvalidState", err)
+	}
+
+	got, err := s.UpdateSpec(t.Context(), in.ID, in.UpdatedAt, spec)
+	if err != nil || got.Status != database.StatusUpdatePending || got.Spec() != spec {
+		t.Fatalf("update: %+v, %v", got, err)
+	}
+
+	claimed, err := s.ClaimPending(t.Context(), 1, time.Hour)
+	if err != nil || len(claimed) != 1 || claimed[0].Status != database.StatusUpdating {
+		t.Fatalf("claimed = %+v, err %v; want one updating row", claimed, err)
+	}
+
+	if err := s.MarkFailed(t.Context(), in.ID, "update failed"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	cur, _ := s.Get(t.Context(), in.ID)
+	if cur.Status != database.StatusUpdateFailed {
+		t.Fatalf("status = %q, want update_failed", cur.Status)
+	}
+
+	if _, err := s.UpdateSpec(t.Context(), in.ID, cur.UpdatedAt, spec); err != nil {
+		t.Fatalf("retry from update_failed: %v", err)
+	}
+	_, _ = s.ClaimPending(t.Context(), 1, time.Hour)
+	if err := s.MarkReady(t.Context(), in.ID, database.Connection{Host: "h"}); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+	if cur, _ = s.Get(t.Context(), in.ID); cur.Status != database.StatusReady {
+		t.Errorf("status = %q, want ready", cur.Status)
+	}
+}
+
+func TestMarkFailedFromProvisioningIsFailed(t *testing.T) {
+	s := newStore(t)
+	in := newDB("alice", "orders")
+	_ = s.Create(t.Context(), in)
+	_, _ = s.ClaimPending(t.Context(), 1, time.Hour) // pending -> provisioning
+
+	if err := s.MarkFailed(t.Context(), in.ID, "provisioning failed"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if cur, _ := s.Get(t.Context(), in.ID); cur.Status != database.StatusFailed {
+		t.Errorf("status = %q, want failed (not update_failed)", cur.Status)
+	}
+	if err := s.MarkFailed(t.Context(), in.ID, "again"); !errors.Is(err, database.ErrInvalidState) {
+		t.Errorf("second MarkFailed: err = %v, want ErrInvalidState", err)
+	}
+}

@@ -364,3 +364,74 @@ func TestPatch(t *testing.T) {
 		t.Errorf("concurrent update: status = %d, want 409", rec.Code)
 	}
 }
+
+func TestDelete(t *testing.T) {
+	store := memory.New()
+	api := NewAPIServer(service.New(store), zap.NewNop())
+	api.RegisterAPI()
+	h := api.Router
+
+	created := mustCreate(t, h, "alice", validBody)
+	path := "/v1/databases/" + created.ID
+
+	// a worker has it: 409 until the operation finishes
+	claimed, _ := store.ClaimPending(t.Context(), 1, time.Hour) // pending -> provisioning
+	if rec := do(t, h, "DELETE", path, "alice", ""); rec.Code != http.StatusConflict {
+		t.Fatalf("while provisioning: status = %d, want 409", rec.Code)
+	}
+	if err := store.MarkReady(t.Context(), claimed[0].ID, database.Connection{Host: "h"}); err != nil {
+		t.Fatalf("mark ready: %v", err)
+	}
+
+	// not yours / not there
+	if rec := do(t, h, "DELETE", path, "bob", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("other owner: status = %d, want 404", rec.Code)
+	}
+	if rec := do(t, h, "DELETE", "/v1/databases/"+uuid.NewString(), "alice", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown id: status = %d, want 404", rec.Code)
+	}
+	if rec := do(t, h, "DELETE", path, "", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("no owner: status = %d, want 401", rec.Code)
+	}
+
+	// accepted
+	rec := do(t, h, "DELETE", path, "alice", "")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("delete: status = %d, want 202; body %s", rec.Code, rec.Body)
+	}
+	if got := decode[databaseResponse](t, rec); got.Status != "delete_pending" {
+		t.Errorf("status = %q, want delete_pending", got.Status)
+	}
+	if loc := rec.Header().Get("Location"); loc != path {
+		t.Errorf("location = %q, want %q", loc, path)
+	}
+
+	// still visible while it is being removed; repeating is harmless; nothing else is allowed
+	if rec := do(t, h, "GET", path, "alice", ""); rec.Code != http.StatusOK ||
+		decode[databaseResponse](t, rec).Status != "delete_pending" {
+		t.Errorf("get during delete: status = %d, body %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, "DELETE", path, "alice", ""); rec.Code != http.StatusAccepted {
+		t.Errorf("repeated delete: status = %d, want 202", rec.Code)
+	}
+	if rec := do(t, h, "PATCH", path, "alice", `{"cpu_millicores":1000}`); rec.Code != http.StatusConflict {
+		t.Errorf("patch during delete: status = %d, want 409", rec.Code)
+	}
+
+	// the worker finishes
+	claimed, _ = store.ClaimPending(t.Context(), 1, time.Hour) // delete_pending -> deleting
+	if len(claimed) != 1 || claimed[0].Status != database.StatusDeleting {
+		t.Fatalf("claimed = %+v", claimed)
+	}
+	if err := store.Delete(t.Context(), claimed[0].ID); err != nil {
+		t.Fatalf("delete row: %v", err)
+	}
+
+	if rec := do(t, h, "GET", path, "alice", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("get after delete: status = %d, want 404", rec.Code)
+	}
+	if rec := do(t, h, "DELETE", path, "alice", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("delete after delete: status = %d, want 404", rec.Code)
+	}
+	mustCreate(t, h, "alice", validBody) // the name is free again
+}

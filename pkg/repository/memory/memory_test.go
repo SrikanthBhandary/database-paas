@@ -120,102 +120,70 @@ func TestConcurrentCreate(t *testing.T) {
 	}
 }
 
-func TestMarkReady(t *testing.T) {
-	s := memory.New()
-	_ = s.Create(t.Context(), newDB("1", "alice", "orders"))
-	if got, _ := s.ClaimPending(t.Context(), 1, time.Hour); len(got) != 1 {
-		t.Fatalf("claim = %+v", got)
-	}
-
-	conn := database.Connection{Host: "orders-rw.tenant-x.svc", Port: 5432, Database: "app", Username: "app",
-		SecretNamespace: "tenant-x", SecretName: "orders-app"}
-	if err := s.MarkReady(t.Context(), "1", conn); err != nil {
-		t.Fatalf("mark ready: %v", err)
-	}
-	got, _ := s.Get(t.Context(), "1")
-	if got.Status != database.StatusReady || got.Connection != conn {
-		t.Errorf("got %+v", got)
-	}
-}
-
-func TestMarkReadyRequiresProvisioning(t *testing.T) {
-	s := memory.New()
-	_ = s.Create(t.Context(), newDB("1", "alice", "orders")) // still pending
-
-	for name, id := range map[string]string{"pending row": "1", "unknown id": "nope"} {
-		if err := s.MarkReady(t.Context(), id, database.Connection{}); !errors.Is(err, database.ErrInvalidState) {
-			t.Errorf("%s: err = %v, want ErrInvalidState", name, err)
-		}
-	}
-}
-
-func TestUpdateLifecycle(t *testing.T) {
+func TestDeleteLifecycle(t *testing.T) {
 	s := memory.New()
 	in := newDB("1", "alice", "orders")
 	in.Status = database.StatusReady
 	_ = s.Create(t.Context(), in)
 
-	spec := database.Spec{
-		Plan:      "medium",
-		Resources: database.Resources{CPUMillicores: 2000, MemoryMB: 4096, StorageGB: 50},
-		Replicas:  3,
-	}
-	got, err := s.UpdateSpec(t.Context(), "1", in.UpdatedAt, spec)
-	if err != nil || got.Status != database.StatusUpdatePending || got.Spec() != spec {
-		t.Fatalf("update: %+v, %v", got, err)
+	got, err := s.RequestDelete(t.Context(), "1")
+	if err != nil || got.Status != database.StatusDeletePending {
+		t.Fatalf("request: %+v, %v", got, err)
 	}
 
-	// a worker claims it: update_pending -> updating
 	claimed, _ := s.ClaimPending(t.Context(), 1, time.Hour)
-	if len(claimed) != 1 || claimed[0].Status != database.StatusUpdating {
-		t.Fatalf("claimed = %+v, want one updating row", claimed)
+	if len(claimed) != 1 || claimed[0].Status != database.StatusDeleting {
+		t.Fatalf("claimed = %+v, want one deleting row", claimed)
 	}
 
-	// it fails: updating -> update_failed (not failed)
-	if err := s.MarkFailed(t.Context(), "1", "update failed"); err != nil {
+	// failed teardown: delete_failed, and a retry is allowed
+	if err := s.MarkFailed(t.Context(), "1", "delete failed"); err != nil {
 		t.Fatalf("mark failed: %v", err)
 	}
-	cur, _ := s.Get(t.Context(), "1")
-	if cur.Status != database.StatusUpdateFailed || cur.StatusReason != "update failed" {
-		t.Fatalf("got %q / %q", cur.Status, cur.StatusReason)
+	if cur, _ := s.Get(t.Context(), "1"); cur.Status != database.StatusDeleteFailed {
+		t.Fatalf("status = %q, want delete_failed", cur.Status)
 	}
-
-	// a retry is allowed from update_failed, and this time it succeeds
-	if _, err := s.UpdateSpec(t.Context(), "1", cur.UpdatedAt, spec); err != nil {
+	if _, err := s.RequestDelete(t.Context(), "1"); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
+
+	// success removes the row
 	_, _ = s.ClaimPending(t.Context(), 1, time.Hour)
-	if err := s.MarkReady(t.Context(), "1", database.Connection{Host: "h"}); err != nil {
-		t.Fatalf("mark ready: %v", err)
+	if err := s.Delete(t.Context(), "1"); err != nil {
+		t.Fatalf("delete: %v", err)
 	}
-	if cur, _ = s.Get(t.Context(), "1"); cur.Status != database.StatusReady {
-		t.Errorf("status = %q, want ready", cur.Status)
+	if _, err := s.Get(t.Context(), "1"); !errors.Is(err, database.ErrNotFound) {
+		t.Errorf("get after delete: err = %v, want ErrNotFound", err)
+	}
+	// and the name is free again
+	if err := s.Create(t.Context(), newDB("2", "alice", "orders")); err != nil {
+		t.Errorf("name should be reusable: %v", err)
 	}
 }
 
-func TestUpdateSpecGuards(t *testing.T) {
+func TestRequestDeleteGuards(t *testing.T) {
 	s := memory.New()
-	ready := newDB("1", "alice", "orders")
-	ready.Status = database.StatusReady
-	_ = s.Create(t.Context(), ready)
-	_ = s.Create(t.Context(), newDB("2", "alice", "pending-one")) // pending
+	for i, st := range []database.Status{database.StatusProvisioning, database.StatusUpdating, database.StatusDeleting} {
+		d := newDB(strconv.Itoa(i), "alice", "db-"+strconv.Itoa(i))
+		d.Status = st
+		_ = s.Create(t.Context(), d)
 
-	spec := database.Spec{Plan: "small", Resources: database.Resources{CPUMillicores: 600, MemoryMB: 1024, StorageGB: 10}, Replicas: 1}
-
-	cases := map[string]struct {
-		id string
-		at time.Time
-	}{
-		"stale version": {"1", ready.UpdatedAt.Add(-time.Second)},
-		"wrong status":  {"2", ready.UpdatedAt},
-		"unknown id":    {"nope", ready.UpdatedAt},
-	}
-	for name, c := range cases {
-		if _, err := s.UpdateSpec(t.Context(), c.id, c.at, spec); !errors.Is(err, database.ErrInvalidState) {
-			t.Errorf("%s: err = %v, want ErrInvalidState", name, err)
+		if _, err := s.RequestDelete(t.Context(), d.ID); !errors.Is(err, database.ErrInvalidState) {
+			t.Errorf("%s: RequestDelete err = %v, want ErrInvalidState", st, err)
 		}
 	}
-	if err := s.MarkFailed(t.Context(), "2", "x"); !errors.Is(err, database.ErrInvalidState) {
-		t.Errorf("MarkFailed on a pending row: err = %v, want ErrInvalidState", err)
+	if _, err := s.RequestDelete(t.Context(), "nope"); !errors.Is(err, database.ErrInvalidState) {
+		t.Errorf("unknown id: err = %v", err)
+	}
+
+	// Delete only removes a row a worker has claimed for deletion
+	ready := newDB("9", "alice", "ready-one")
+	ready.Status = database.StatusReady
+	_ = s.Create(t.Context(), ready)
+	if err := s.Delete(t.Context(), "9"); !errors.Is(err, database.ErrInvalidState) {
+		t.Errorf("Delete on a ready row: err = %v, want ErrInvalidState", err)
+	}
+	if _, err := s.Get(t.Context(), "9"); err != nil {
+		t.Errorf("row must still exist: %v", err)
 	}
 }

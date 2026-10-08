@@ -4,3 +4,24 @@ There's no way to obtain the password. The usual shape is POST /v1/databases/{id
 UpdateStatus is still unguarded. MarkReady refuses to overwrite a row that isn't provisioning, but the failed path doesn't, so a late failure could still overwrite a newer state. The transition rules in the delete step close this gap.
 
 Next in the plan is DELETE with those transition rules. Want to start there?
+
+
+Limits of this version
+Backups are orphaned. Deleting the ObjectStore also ends retention cleanup, so the data in S3 lingers forever, costing money and holding customer data you may be obliged to remove. The usual designs are a grace period (keep for N days so an accidental delete is recoverable, then purge) or purge on delete. Either needs an S3 client and a retention job, and I'd make it its own step.
+No undo and no deletion protection. DELETE is irreversible once the worker runs. A deletion_protection flag the client must switch off first is cheap and prevents the worst mistakes.
+No final backup before teardown.
+Namespaces are never removed. An owner with zero databases keeps an empty namespace and the shared backup Secret. Removing it safely means checking that no database is mid-create for that owner, so it's better as a periodic cleanup job than inside the delete path.
+A database stuck in provisioning can't be deleted until the worker finishes or the row is reclaimed after ReclaimAfter (15 minutes by default, so use -reclaim-after 30s in development). That's the price of not letting two workers touch the same objects.
+The delete runs under the provisioning timeout and holds a worker slot while volumes drain. Fine at this scale.
+Deleted databases still show up in GET /v1/databases as delete_pending or deleting until they're gone, which is honest but may surprise clients.
+The name stays reserved during teardown, so recreating it returns 409 until the delete finishes.
+Next
+
+The lifecycle (create, read, update, delete) now works end to end. The gaps that matter most are:
+
+Credentials endpoint: POST /v1/databases/{id}/credentials reads the password from the Kubernetes Secret you already record by reference. It's authenticated, returns it once, and is the thing that makes connection usable.
+Retries with attempts and backoff, so a transient Kubernetes error doesn't strand a row in a *_failed state.
+Backup purge and retention (the orphaned-backups problem above).
+Real authentication replacing X-Owner-ID.
+
+I'd do the credentials endpoint next, since without it a user can't actually connect to what you provision. Want to start there?

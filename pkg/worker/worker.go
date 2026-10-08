@@ -18,6 +18,7 @@ type Store interface {
 	UpdateStatus(ctx context.Context, id string, status database.Status, reason string) error
 	MarkReady(ctx context.Context, id string, c database.Connection) error
 	MarkFailed(ctx context.Context, id, reason string) error
+	Delete(ctx context.Context, id string) error
 }
 
 // Provisioner creates the real database. It blocks until the database is
@@ -25,6 +26,7 @@ type Store interface {
 // be provisioned again.
 type Provisioner interface {
 	Provision(ctx context.Context, db database.Database) (database.Connection, error)
+	Deprovision(ctx context.Context, db database.Database) error
 }
 
 type Config struct {
@@ -121,27 +123,43 @@ func (w *Worker) poll(ctx context.Context) {
 		})
 	}
 }
+
 func (w *Worker) process(ctx context.Context, db database.Database) {
+	// the claim already moved the row to its in-progress status
 	op := "provisioning"
-	if db.Status == database.StatusUpdating { // the claim already moved update_pending -> updating
+	switch db.Status {
+	case database.StatusUpdating:
 		op = "update"
+	case database.StatusDeleting:
+		op = "delete"
 	}
 	log := w.log.With(zap.String("database_id", db.ID), zap.String("name", db.Name), zap.String("operation", op))
 	log.Info("started")
 
 	pctx, cancel := context.WithTimeout(ctx, w.cfg.ProvisionTimeout)
 	defer cancel()
-	conn, err := w.prov.Provision(pctx, db) // idempotent: the same call creates or updates
+
+	var (
+		conn database.Connection
+		err  error
+	)
+	if op == "delete" {
+		err = w.prov.Deprovision(pctx, db)
+	} else {
+		conn, err = w.prov.Provision(pctx, db)
+	}
 
 	wctx, wcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer wcancel()
 
 	switch {
+	case err == nil && op == "delete":
+		w.finishDelete(wctx, log, db.ID)
 	case err == nil:
 		w.markReady(wctx, log, db.ID, conn)
 
 	case ctx.Err() != nil:
-		log.Warn("interrupted by shutdown", zap.Error(err))
+		log.Warn("interrupted by shutdown", zap.Error(err)) // reclaimed later
 
 	default:
 		reason := op + " failed" // client-visible, so never the raw error
@@ -150,6 +168,18 @@ func (w *Worker) process(ctx context.Context, db database.Database) {
 		}
 		log.Error("failed", zap.Error(err))
 		w.markFailed(wctx, log, db.ID, reason)
+	}
+}
+
+func (w *Worker) finishDelete(ctx context.Context, log *zap.Logger, id string) {
+	err := w.store.Delete(ctx, id)
+	switch {
+	case err == nil:
+		log.Info("database deleted")
+	case errors.Is(err, database.ErrInvalidState):
+		log.Warn("result discarded: row is no longer deleting")
+	default:
+		log.Error("remove row", zap.Error(err)) // stays deleting; reclaimed, teardown is idempotent
 	}
 }
 

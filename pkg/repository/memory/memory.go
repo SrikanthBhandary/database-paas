@@ -9,6 +9,17 @@ import (
 	"time"
 )
 
+// claimedStatus is what a queued row becomes when a worker claims it.
+var claimedStatus = map[database.Status]database.Status{
+	database.StatusPending:       database.StatusProvisioning,
+	database.StatusUpdatePending: database.StatusUpdating,
+	database.StatusDeletePending: database.StatusDeleting,
+}
+
+func inProgress(st database.Status) bool {
+	return st == database.StatusProvisioning || st == database.StatusUpdating || st == database.StatusDeleting
+}
+
 type Store struct {
 	mu    sync.RWMutex
 	items map[string]database.Database
@@ -90,10 +101,8 @@ func (s *Store) ClaimPending(_ context.Context, limit int, reclaimAfter time.Dur
 	now := time.Now().UTC()
 	var eligible []database.Database
 	for _, db := range s.items {
-		queued := db.Status == database.StatusPending || db.Status == database.StatusUpdatePending
-		stale := reclaimAfter > 0 &&
-			(db.Status == database.StatusProvisioning || db.Status == database.StatusUpdating) &&
-			now.Sub(db.UpdatedAt) >= reclaimAfter
+		_, queued := claimedStatus[db.Status]
+		stale := reclaimAfter > 0 && inProgress(db.Status) && now.Sub(db.UpdatedAt) >= reclaimAfter
 		if queued || stale {
 			eligible = append(eligible, db)
 		}
@@ -107,11 +116,8 @@ func (s *Store) ClaimPending(_ context.Context, limit int, reclaimAfter time.Dur
 	}
 
 	for i := range eligible {
-		switch eligible[i].Status { // stale rows keep their in-progress status
-		case database.StatusPending:
-			eligible[i].Status = database.StatusProvisioning
-		case database.StatusUpdatePending:
-			eligible[i].Status = database.StatusUpdating
+		if next, ok := claimedStatus[eligible[i].Status]; ok { // stale rows keep their status
+			eligible[i].Status = next
 		}
 		eligible[i].StatusReason = ""
 		eligible[i].UpdatedAt = now
@@ -151,6 +157,8 @@ func (s *Store) MarkFailed(_ context.Context, id, reason string) error {
 		db.Status = database.StatusFailed
 	case database.StatusUpdating:
 		db.Status = database.StatusUpdateFailed
+	case database.StatusDeleting:
+		db.Status = database.StatusDeleteFailed
 	default:
 		return database.ErrInvalidState
 	}
@@ -180,4 +188,41 @@ func (s *Store) UpdateSpec(_ context.Context, id string, expectedUpdatedAt time.
 	db.UpdatedAt = time.Now().UTC()
 	s.items[id] = db
 	return db, nil
+}
+
+// RequestDelete queues a delete. Rows that are missing or have an operation in
+// flight return ErrInvalidState, exactly like the Postgres store.
+func (s *Store) RequestDelete(_ context.Context, id string) (database.Database, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	db, ok := s.items[id]
+	if !ok {
+		return database.Database{}, database.ErrInvalidState
+	}
+	switch db.Status {
+	case database.StatusPending, database.StatusReady, database.StatusFailed,
+		database.StatusUpdatePending, database.StatusUpdateFailed, database.StatusDeleteFailed:
+	default:
+		return database.Database{}, database.ErrInvalidState
+	}
+	db.Status = database.StatusDeletePending
+	db.StatusReason = ""
+	db.UpdatedAt = time.Now().UTC()
+	s.items[id] = db
+	return db, nil
+}
+
+// Delete removes the row once teardown has finished. Only a row a worker has
+// claimed for deletion (status deleting) can be removed.
+func (s *Store) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	db, ok := s.items[id]
+	if !ok || db.Status != database.StatusDeleting {
+		return database.ErrInvalidState
+	}
+	delete(s.items, id)
+	return nil
 }

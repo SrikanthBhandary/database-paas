@@ -159,14 +159,15 @@ func (s *Store) ClaimPending(ctx context.Context, limit int, reclaimAfter time.D
 		SET status = CASE status
 				        WHEN 'pending'        THEN 'provisioning'
 				        WHEN 'update_pending' THEN 'updating'
+				        WHEN 'delete_pending' THEN 'deleting'
 				        ELSE status
 				    END,
 				    status_reason = '', updated_at = now()
 		WHERE id IN (
 			SELECT id FROM databases
-			WHERE status IN ('pending', 'update_pending')
+			WHERE status IN ('pending', 'update_pending', 'delete_pending')
 			  OR ($2::float8 > 0
-					AND status IN ('provisioning', 'updating')
+					AND status IN ('provisioning', 'updating','deleting')
 					AND updated_at < now() - make_interval(secs => $2::float8))
 			ORDER BY created_at, id
 			LIMIT $1
@@ -221,9 +222,13 @@ func (s *Store) MarkReady(ctx context.Context, id string, c database.Connection)
 func (s *Store) MarkFailed(ctx context.Context, id, reason string) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE databases SET
-			status = CASE status WHEN 'updating' THEN 'update_failed' ELSE 'failed' END,
+			status = CASE status
+				WHEN 'provisioning' THEN 'failed'
+				WHEN 'updating'     THEN 'update_failed'
+				WHEN 'deleting'     THEN 'delete_failed'
+			END,
 			status_reason = $2, updated_at = now()
-		WHERE id = $1 AND status IN ('provisioning', 'updating')`, id, reason)
+		WHERE id = $1 AND status IN ('provisioning', 'updating', 'deleting')`, id, reason)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -251,4 +256,32 @@ func (s *Store) UpdateSpec(ctx context.Context, id string, expectedUpdatedAt tim
 		return database.Database{}, mapErr(err)
 	}
 	return db, nil
+}
+
+func (s *Store) RequestDelete(ctx context.Context, id string) (database.Database, error) {
+	row := s.pool.QueryRow(ctx, `
+		UPDATE databases SET status = 'delete_pending', status_reason = '', updated_at = now()
+		WHERE id = $1 AND status IN
+			('pending', 'ready', 'failed', 'update_pending', 'update_failed', 'delete_failed')
+		RETURNING `+columns, id)
+
+	db, err := scan(row)
+	if errors.Is(err, pgx.ErrNoRows) { // checked before mapErr, which would say "not found"
+		return database.Database{}, database.ErrInvalidState
+	}
+	if err != nil {
+		return database.Database{}, mapErr(err)
+	}
+	return db, nil
+}
+
+func (s *Store) Delete(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM databases WHERE id = $1 AND status = 'deleting'`, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	if tag.RowsAffected() == 0 {
+		return database.ErrInvalidState
+	}
+	return nil
 }

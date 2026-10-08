@@ -183,3 +183,90 @@ func (p *Provisioner) waitReady(ctx context.Context, ns, name string, stablePoll
 		}
 	}
 }
+
+// Deprovision removes everything Provision created for db and returns once
+// the Cluster and its volumes are really gone. Missing objects are fine, so
+// it can be re-run after a crash or a partial failure.
+func (p *Provisioner) Deprovision(ctx context.Context, db database.Database) error {
+	ns := namespaceFor(db.OwnerID)
+
+	// stop new backups first, then the database, then the backup config it used
+	if err := p.deleteOwned(ctx, gvrScheduledBackup, ns, scheduleName(db), db.ID, metav1.DeletePropagationBackground); err != nil {
+		return err
+	}
+	if err := p.deleteOwned(ctx, gvrCluster, ns, db.Name, db.ID, metav1.DeletePropagationForeground); err != nil {
+		return err
+	}
+	if err := p.waitGone(ctx, ns, db.Name); err != nil {
+		return err
+	}
+	// the ObjectStore must outlive the Cluster that archives WAL into it
+	return p.deleteOwned(ctx, gvrObjectStore, ns, objectStoreName(db), db.ID, metav1.DeletePropagationBackground)
+}
+
+// deleteOwned deletes name only if it carries this database's ID label, so a
+// same-named object belonging to something else is never touched.
+func (p *Provisioner) deleteOwned(ctx context.Context, gvr schema.GroupVersionResource, ns, name, dbID string, prop metav1.DeletionPropagation) error {
+	ri := p.client.Resource(gvr).Namespace(ns)
+
+	obj, err := ri.Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get %s %s/%s: %w", gvr.Resource, ns, name, err)
+	}
+	if id := obj.GetLabels()[labelDatabaseID]; id != dbID {
+		return fmt.Errorf("%s %s/%s belongs to database %q, not %q; refusing to delete",
+			gvr.Resource, ns, name, id, dbID)
+	}
+
+	uid := obj.GetUID() // delete exactly the object we just checked, not a replacement
+	err = ri.Delete(ctx, name, metav1.DeleteOptions{
+		PropagationPolicy: &prop,
+		Preconditions:     &metav1.Preconditions{UID: &uid},
+	})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("delete %s %s/%s: %w", gvr.Resource, ns, name, err)
+	}
+	return nil
+}
+
+// waitGone waits until the Cluster object and its volume claims are gone.
+// Volumes matter: a new database with the same name must not inherit old ones.
+func (p *Provisioner) waitGone(ctx context.Context, ns, name string) error {
+	ticker := time.NewTicker(p.cfg.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		gone, why := p.isGone(ctx, ns, name)
+		if gone {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("cluster %s/%s not removed (%s): %w", ns, name, why, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *Provisioner) isGone(ctx context.Context, ns, name string) (bool, string) {
+	_, err := p.client.Resource(gvrCluster).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return false, "cluster still exists"
+	case !apierrors.IsNotFound(err):
+		return false, "get cluster: " + err.Error()
+	}
+
+	pvcs, err := p.client.Resource(gvrPVC).Namespace(ns).List(ctx,
+		metav1.ListOptions{LabelSelector: labelCNPGCluster + "=" + name})
+	if err != nil {
+		return false, "list volume claims: " + err.Error()
+	}
+	if n := len(pvcs.Items); n > 0 {
+		return false, fmt.Sprintf("%d volume claim(s) remaining", n)
+	}
+	return true, ""
+}

@@ -24,6 +24,8 @@ const (
 	pluginName       = "barman-cloud.cloudnative-pg.io"
 	backupSecretName = "backup-s3"
 	phaseHealthy     = "Cluster in healthy state"
+	labelCNPGCluster = "cnpg.io/cluster" // CNPG puts this on the pods and volume claims it creates
+
 )
 
 var (
@@ -32,6 +34,7 @@ var (
 	gvrCluster         = schema.GroupVersionResource{Group: "postgresql.cnpg.io", Version: "v1", Resource: "clusters"}
 	gvrScheduledBackup = schema.GroupVersionResource{Group: "postgresql.cnpg.io", Version: "v1", Resource: "scheduledbackups"}
 	gvrObjectStore     = schema.GroupVersionResource{Group: "barmancloud.cnpg.io", Version: "v1", Resource: "objectstores"}
+	gvrPVC             = schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}
 )
 
 // namespaceFor derives a DNS-safe namespace from an arbitrary owner ID.

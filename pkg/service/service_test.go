@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"maps"
 	"slices"
@@ -687,5 +688,85 @@ func TestUpdateDatabase_OtherOwnerSeesNotFound(t *testing.T) {
 	_, _, err := svc.UpdateDatabase(t.Context(), "bob", db.ID, UpdateDatabaseInput{CPUMillicores: intp(1000)})
 	if !errors.Is(err, database.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// databaseIn creates a database and forces it into the given status.
+func databaseIn(t *testing.T, svc *Service, store interface {
+	UpdateStatus(ctx context.Context, id string, status database.Status, reason string) error
+}, st database.Status) database.Database {
+	t.Helper()
+	created, err := svc.CreateDatabase(t.Context(), smallInput())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := store.UpdateStatus(t.Context(), created.ID, st, ""); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+	return created
+}
+
+func TestDeleteDatabase_Allowed(t *testing.T) {
+	for _, st := range []database.Status{
+		database.StatusPending, database.StatusReady, database.StatusFailed,
+		database.StatusUpdatePending, database.StatusUpdateFailed, database.StatusDeleteFailed,
+	} {
+		t.Run(string(st), func(t *testing.T) {
+			svc, store := newTestService(t)
+			db := databaseIn(t, svc, store, st)
+
+			got, err := svc.DeleteDatabase(t.Context(), "alice", db.ID)
+			if err != nil || got.Status != database.StatusDeletePending {
+				t.Fatalf("got %+v, %v; want delete_pending", got, err)
+			}
+			if stored, _ := store.Get(t.Context(), db.ID); stored.Status != database.StatusDeletePending {
+				t.Errorf("stored status = %q", stored.Status)
+			}
+		})
+	}
+}
+
+func TestDeleteDatabase_BlockedWhileInProgress(t *testing.T) {
+	for _, st := range []database.Status{database.StatusProvisioning, database.StatusUpdating} {
+		t.Run(string(st), func(t *testing.T) {
+			svc, store := newTestService(t)
+			db := databaseIn(t, svc, store, st)
+
+			if _, err := svc.DeleteDatabase(t.Context(), "alice", db.ID); !errors.Is(err, database.ErrInvalidState) {
+				t.Fatalf("err = %v, want ErrInvalidState", err)
+			}
+			if stored, _ := store.Get(t.Context(), db.ID); stored.Status != st {
+				t.Errorf("status changed to %q", stored.Status)
+			}
+		})
+	}
+}
+
+func TestDeleteDatabase_IsIdempotent(t *testing.T) {
+	for _, st := range []database.Status{database.StatusDeletePending, database.StatusDeleting} {
+		t.Run(string(st), func(t *testing.T) {
+			svc, store := newTestService(t)
+			db := databaseIn(t, svc, store, st)
+
+			got, err := svc.DeleteDatabase(t.Context(), "alice", db.ID)
+			if err != nil || got.Status != st {
+				t.Fatalf("got %+v, %v; want unchanged %q", got, err, st)
+			}
+		})
+	}
+}
+
+func TestDeleteDatabase_NotFound(t *testing.T) {
+	svc, store := newTestService(t)
+	db := databaseIn(t, svc, store, database.StatusReady)
+
+	if _, err := svc.DeleteDatabase(t.Context(), "bob", db.ID); !errors.Is(err, database.ErrNotFound) {
+		t.Errorf("other owner: err = %v, want ErrNotFound", err)
+	}
+	if _, err := svc.DeleteDatabase(t.Context(), "alice", "no-such-id"); !errors.Is(err, database.ErrNotFound) {
+		t.Errorf("unknown id: err = %v, want ErrNotFound", err)
+	}
+	if stored, _ := store.Get(t.Context(), db.ID); stored.Status != database.StatusReady {
+		t.Errorf("another owner's delete changed the row to %q", stored.Status)
 	}
 }

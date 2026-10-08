@@ -204,3 +204,25 @@ func resolveUpdate(cur database.Database, in UpdateDatabaseInput) (database.Spec
 	}
 	return spec, errs
 }
+
+// DeleteDatabase queues teardown. Calling it again while teardown is already
+// queued or running is a no-op that returns the current state.
+func (s *Service) DeleteDatabase(ctx context.Context, ownerID, id string) (database.Database, error) {
+	cur, err := s.GetDatabase(ctx, ownerID, id) // also enforces ownership
+	if err != nil {
+		return database.Database{}, err
+	}
+
+	switch cur.Status {
+	case database.StatusDeletePending, database.StatusDeleting:
+		return cur, nil // already on its way out
+	case database.StatusProvisioning, database.StatusUpdating:
+		// a worker is applying objects right now; deleting underneath it
+		// would race. Try again once the operation finishes.
+		return database.Database{}, fmt.Errorf("status %q: %w", cur.Status, database.ErrInvalidState)
+	}
+
+	// The store re-checks the status atomically, so a worker claiming the row
+	// between our read and this write turns into a 409, not a lost update.
+	return s.store.RequestDelete(ctx, cur.ID)
+}

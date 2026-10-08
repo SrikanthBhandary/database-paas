@@ -19,7 +19,10 @@ const (
 	StatusUpdatePending Status = "update_pending" // change accepted, waiting for a worker
 	StatusUpdating      Status = "updating"       // a worker is applying it
 	StatusUpdateFailed  Status = "update_failed"  // did not apply; PATCH again to retry
+	StatusDeletePending Status = "delete_pending" // delete accepted, waiting for a worker
+	StatusDeleteFailed  Status = "delete_failed"  // teardown failed; DELETE again to retry
 )
+
 
 func (e Engine) Valid() bool {
 	return e == EnginePostgres || e == EngineMySQL
@@ -27,8 +30,10 @@ func (e Engine) Valid() bool {
 
 func (s Status) Valid() bool {
 	switch s {
-	case StatusPending, StatusProvisioning, StatusReady, StatusFailed, StatusDeleting,
-		StatusUpdatePending, StatusUpdating, StatusUpdateFailed:
+	case StatusPending, StatusProvisioning,
+		StatusReady, StatusFailed, StatusDeleting,
+		StatusUpdatePending, StatusUpdating, StatusUpdateFailed,
+		StatusDeletePending, StatusDeleteFailed:
 		return true
 	}
 	return false
@@ -36,11 +41,10 @@ func (s Status) Valid() bool {
 
 // Spec is the part of a database a client can change after creation.
 type Spec struct {
-	Plan      string
+	Plan    string
 	Resources Resources
-	Replicas  int
+	Replicas int
 }
-
 
 type Database struct {
 	ID           string

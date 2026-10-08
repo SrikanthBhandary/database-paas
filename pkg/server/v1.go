@@ -62,3 +62,14 @@ func (as *APIServer) updateDatabase(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Location", v1+"/databases/"+db.ID)
 	as.writeJSON(w, http.StatusAccepted, toResponse(db))
 }
+
+// DELETE /v1/databases/{id}: queues teardown. Poll GET until it returns 404.
+func (as *APIServer) deleteDatabase(w http.ResponseWriter, r *http.Request) {
+	db, err := as.svc.DeleteDatabase(r.Context(), ownerFrom(r.Context()), r.PathValue("id"))
+	if err != nil {
+		as.writeError(w, r, err)
+		return
+	}
+	w.Header().Set("Location", v1+"/databases/"+db.ID)
+	as.writeJSON(w, http.StatusAccepted, toResponse(db))
+}

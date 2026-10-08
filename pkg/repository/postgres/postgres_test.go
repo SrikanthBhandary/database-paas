@@ -402,3 +402,67 @@ func TestMarkFailedFromProvisioningIsFailed(t *testing.T) {
 		t.Errorf("second MarkFailed: err = %v, want ErrInvalidState", err)
 	}
 }
+
+func TestDeleteLifecycle(t *testing.T) {
+	s := newStore(t)
+	in := newDB("alice", "orders")
+	in.Status = database.StatusReady
+	_ = s.Create(t.Context(), in)
+
+	got, err := s.RequestDelete(t.Context(), in.ID)
+	if err != nil || got.Status != database.StatusDeletePending {
+		t.Fatalf("request: %+v, %v", got, err)
+	}
+
+	claimed, err := s.ClaimPending(t.Context(), 1, time.Hour)
+	if err != nil || len(claimed) != 1 || claimed[0].Status != database.StatusDeleting {
+		t.Fatalf("claimed = %+v, err %v; want one deleting row", claimed, err)
+	}
+
+	if err := s.MarkFailed(t.Context(), in.ID, "delete failed"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	if cur, _ := s.Get(t.Context(), in.ID); cur.Status != database.StatusDeleteFailed {
+		t.Fatalf("status = %q, want delete_failed", cur.Status)
+	}
+
+	if _, err := s.RequestDelete(t.Context(), in.ID); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	_, _ = s.ClaimPending(t.Context(), 1, time.Hour)
+	if err := s.Delete(t.Context(), in.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := s.Get(t.Context(), in.ID); !errors.Is(err, database.ErrNotFound) {
+		t.Errorf("get after delete: err = %v, want ErrNotFound", err)
+	}
+	if err := s.Create(t.Context(), newDB("alice", "orders")); err != nil {
+		t.Errorf("name should be reusable: %v", err)
+	}
+}
+
+func TestRequestDeleteGuards(t *testing.T) {
+	s := newStore(t)
+	for i, st := range []database.Status{database.StatusProvisioning, database.StatusUpdating, database.StatusDeleting} {
+		d := newDB("alice", fmt.Sprintf("db-%d", i))
+		d.Status = st
+		_ = s.Create(t.Context(), d)
+
+		if _, err := s.RequestDelete(t.Context(), d.ID); !errors.Is(err, database.ErrInvalidState) {
+			t.Errorf("%s: err = %v, want ErrInvalidState", st, err)
+		}
+	}
+	if _, err := s.RequestDelete(t.Context(), uuid.NewString()); !errors.Is(err, database.ErrInvalidState) {
+		t.Errorf("unknown id: err = %v", err)
+	}
+
+	ready := newDB("alice", "ready-one")
+	ready.Status = database.StatusReady
+	_ = s.Create(t.Context(), ready)
+	if err := s.Delete(t.Context(), ready.ID); !errors.Is(err, database.ErrInvalidState) {
+		t.Errorf("Delete on a ready row: err = %v, want ErrInvalidState", err)
+	}
+	if _, err := s.Get(t.Context(), ready.ID); err != nil {
+		t.Errorf("row must still exist: %v", err)
+	}
+}

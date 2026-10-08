@@ -73,3 +73,20 @@ func ownerFrom(ctx context.Context) string {
 	owner, _ := ctx.Value(ownerKey).(string)
 	return owner
 }
+
+func CORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers
+		w.Header().Set("Access-Control-Allow-Origin", "*") // Or specify "http://localhost:3000"
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Owner-ID")
+
+		// Handle preflight OPTIONS requests sent by the browser before POST/PATCH/DELETE
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}

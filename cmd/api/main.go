@@ -64,7 +64,9 @@ func main() {
 	api := server.NewAPIServer(service.New(store), log)
 	api.RegisterAPI()
 
-	handler := server.LoggingMiddleware(log)(api.Router)
+	var handler http.Handler = api.Router
+	handler = server.LoggingMiddleware(log)(handler)
+	handler = server.CORSMiddleware(handler)
 
 	srv := &http.Server{
 		Addr:              ":" + port,

@@ -201,3 +201,21 @@ cover-html: cover ## open the coverage report in a browser
 cover-unit: ## coverage without a database (excludes the Postgres package)
 	go -C $(GO_DIR) test -race -count=1 -coverprofile=$(COVER_OUT) -covermode=atomic ./...
 	go -C $(GO_DIR) tool cover -func=$(COVER_OUT) | tail -n 1
+
+
+.PHONY: run-api
+run-api: ## run the API server (no worker) against local Postgres
+	DATABASE_URL="$(DATABASE_URL)" go -C $(GO_DIR) run ./cmd/api -port $(PORT)
+
+.PHONY: run-worker
+run-worker: ## run a provisioning worker against local Postgres
+	DATABASE_URL="$(DATABASE_URL)" go -C $(GO_DIR) run ./cmd/worker
+
+.PHONY: run-all
+run-all: ## API with the in-process worker (single terminal, development)
+	DATABASE_URL="$(DATABASE_URL)" go -C $(GO_DIR) run ./cmd/api -port $(PORT) -worker
+
+.PHONY: build
+build: ## build both binaries into bin/
+	go -C $(GO_DIR) build -o ../bin/api ./cmd/api
+	go -C $(GO_DIR) build -o ../bin/worker ./cmd/worker

@@ -5,7 +5,6 @@ UpdateStatus is still unguarded. MarkReady refuses to overwrite a row that isn't
 
 Next in the plan is DELETE with those transition rules. Want to start there?
 
-
 Limits of this version
 Backups are orphaned. Deleting the ObjectStore also ends retention cleanup, so the data in S3 lingers forever, costing money and holding customer data you may be obliged to remove. The usual designs are a grace period (keep for N days so an accidental delete is recoverable, then purge) or purge on delete. Either needs an S3 client and a retention job, and I'd make it its own step.
 No undo and no deletion protection. DELETE is irreversible once the worker runs. A deletion_protection flag the client must switch off first is cheap and prevents the worst mistakes.
@@ -25,3 +24,22 @@ Backup purge and retention (the orphaned-backups problem above).
 Real authentication replacing X-Owner-ID.
 
 I'd do the credentials endpoint next, since without it a user can't actually connect to what you provision. Want to start there?
+
+
+Limits of this version
+The stable-poll wait is a heuristic, as described in step 7. Verify the generation field on a live Cluster and replace it.
+There's no automatic retry. A transient Kubernetes error lands the row in update_failed, and the client re-sends the PATCH. The attempts column with backoff is still on the list.
+After update_failed the row holds the desired spec, not what is actually running. A GET shows the new numbers next to the failed status. If you want honesty here, the later fix is storing applied and desired separately.
+Autoscale and backup settings aren't patchable yet. That causes one awkward interaction: with autoscale on, storage can't grow past the ceiling and the ceiling can't be raised, so adding autoscale and backup to PATCH is the natural follow-up.
+Create is still plan-only for CPU and memory. If you want the same bounds there, accept the optional fields in CreateDatabaseInput and run the same checks.
+No CPU-to-memory ratio check. 8 CPUs with 512 MB is accepted. A sanity rule per plan fits the same function.
+No rollback. A half-applied rolling restart can't simply be undone, so recovery is a new PATCH.
+
+
+Limits of this version
+The worker slot is held while waiting (minutes per database), so -concurrency caps how many databases can be coming up at once. Fine for now. The later fix is applying, recording provisioning, and checking readiness on a separate pass.
+Failures only show up as a timeout. A bad image or an unschedulable pod looks the same as a slow start until the 10 minutes run out. The log line with the last phase is how you tell them apart.
+MySQL rows fail with provisioning failed, and the client sees nothing useful. Until a MySQL provisioner exists, the clean fix is for the service to reject engines that nothing can provision, instead of accepting them and failing later.
+Create only. Changing a database (resize, backup settings) doesn't re-apply anything, and nothing deletes Kubernetes objects yet. Both belong to the next step.
+One shared S3 credential for all tenants, and no NetworkPolicy or ResourceQuota per tenant namespace. Fine for dev, not for production.
+The API can't tell users how to connect yet. After ready they need the host (orders-rw.<namespace>.svc), port, database and user, plus a reference to the secret, but never the password itself.

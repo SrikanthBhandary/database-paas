@@ -230,3 +230,7 @@ run-worker-cnpg: ## run a worker that provisions real CNPG clusters in kind
 	DATABASE_URL="$(DATABASE_URL)" \
 	go -C $(GO_DIR) run ./cmd/worker -provisioner cnpg \
 		-s3-endpoint $(S3_ENDPOINT) -s3-bucket $(S3_BUCKET)
+
+.PHONY:
+run-front-end:
+	go run cmd/front_end/main.go
